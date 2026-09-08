@@ -49,19 +49,24 @@ CREATE TABLE IF NOT EXISTS categories (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-INSERT INTO categories (code, label_ko, emoji, sort_order, is_active, note) VALUES
-    ('music',   '음악',        '🎵', 1, TRUE,  '아이돌·가수, 음원·앨범, 차트, 컴백'),
-    ('drama',   '드라마',      '📺', 2, TRUE,  '방영·캐스팅·시청률·종영'),
-    ('show',    '예능·방송',   '🎬', 3, TRUE,  '예능 프로그램, 출연진'),
-    ('celeb',   '연예인 소식', '⭐', 4, TRUE,  '배우, 기획사, 열애·결혼, 논란'),
-    ('event',   '공연·시상식', '🎤', 5, TRUE,  '콘서트, 팬미팅, 시상식, 투어, 티켓'),
-    ('movie',   '영화',        '🍿', 6, TRUE,  '개봉·박스오피스·흥행 (작품 해설 제외)'),
-    ('webtoon', '웹툰·IP',     '📚', 7, TRUE,  '웹툰·웹소설, 원작 영상화'),
-    ('trend',   '온라인 화제', '🔥', 8, TRUE,  '밈, 유행, 화제성'),
-    -- 아래 3개는 예술팀 영역. 예술팀이 없으면 is_active 를 TRUE 로.
-    ('stage',      '공연·뮤지컬', '🎭', 20, FALSE, '뮤지컬·연극·클래식 (예술팀 영역)'),
-    ('exhibition', '전시',        '🖼️', 21, FALSE, '미술관·박물관 전시 (예술팀 영역)'),
-    ('book',       '도서·문학',   '📖', 22, FALSE, '신간·문학상·작가 (예술팀 영역)')
+INSERT INTO categories (
+    code,
+    name,
+    description,
+    is_active
+)
+VALUES
+    ('music', '음악', '아이돌·가수, 음원·앨범, 차트, 컴백', TRUE),
+    ('drama', '드라마', '방영·캐스팅·시청률·종영', TRUE),
+    ('show', '예능·방송', '예능 프로그램, 출연진', TRUE),
+    ('celeb', '연예인 소식', '배우, 기획사, 열애·결혼, 논란', TRUE),
+    ('event', '공연·시상식', '콘서트, 팬미팅, 시상식, 투어, 티켓', TRUE),
+    ('movie', '영화', '개봉·박스오피스·흥행', TRUE),
+    ('webtoon', '웹툰·IP', '웹툰·웹소설, 원작 영상화', TRUE),
+    ('trend', '온라인 화제', '밈, 유행, 화제성', TRUE),
+    ('stage', '공연·뮤지컬', '뮤지컬·연극·클래식', FALSE),
+    ('exhibition', '전시', '미술관·박물관 전시', FALSE),
+    ('book', '도서·문학', '신간·문학상·작가', FALSE)
 ON CONFLICT (code) DO NOTHING;
 
 
