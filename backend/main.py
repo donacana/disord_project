@@ -5,10 +5,12 @@ from fastapi.responses import JSONResponse
 
 if __package__:
     from . import db
-    from .schemas import AskRequest, AskResponse, SourceItem
+    from .schemas import AskRequest, AskResponse
+    from .rag import RAGError, answer_question
 else:
     import db
-    from schemas import AskRequest, AskResponse, SourceItem
+    from schemas import AskRequest, AskResponse
+    from rag import RAGError, answer_question
 
 app = FastAPI(title='Entertainment Culture RAG API')
 logger = logging.getLogger(__name__)
@@ -48,25 +50,10 @@ def stats():
         raise HTTPException(status_code=503, detail=str(error)) from None
 
 
-def search_articles(question: str, top_k: int) -> list[SourceItem]:
-    """Placeholder: no database search or embedding calls yet."""
-    return []
-
-
-def generate_answer(question: str, sources: list[SourceItem]) -> str:
-    """Placeholder: no LLM calls yet."""
-    return 'RAG 검색 기능은 아직 연결되지 않았습니다.'
-
-
-def handle_ask(request: AskRequest) -> AskResponse:
-    sources = search_articles(request.question, request.top_k)
-    return AskResponse(
-        answer=generate_answer(request.question, sources),
-        sources=sources,
-        domain='ent_culture',
-    )
-
-
 @app.post('/ask', response_model=AskResponse)
 def ask(request: AskRequest):
-    return handle_ask(request)
+    try:
+        return answer_question(request.question, request.top_k)
+    except (db.DatabaseError, RAGError) as error:
+        logger.warning('%s', error)
+        raise HTTPException(status_code=503, detail=str(error)) from None

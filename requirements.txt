@@ -1,0 +1,5 @@
+feedparser
+trafilatura
+psycopg[binary]
+openai
+python-dotenv

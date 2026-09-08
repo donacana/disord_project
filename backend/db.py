@@ -33,3 +33,22 @@ def fetch_one(query: str):
                 return cursor.fetchone()
     except psycopg.Error:
         raise DatabaseError('DB 쿼리 실행 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
+
+
+def fetch_all(query: str, params: tuple = ()) -> list[dict]:
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                return cursor.fetchall()
+    except psycopg.Error:
+        raise DatabaseError('DB 검색 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
+
+
+def execute(query: str, params: tuple = ()) -> None:
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+    except psycopg.Error:
+        raise DatabaseError('DB 기록 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
