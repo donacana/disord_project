@@ -16,6 +16,9 @@ import psycopg
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from sources_rss import EXTRA_RSS_SOURCES
+from sources_naver import fetch_naver_news, NAVER_SEARCH_QUERIES
+
 # ── 환경변수 로드 ──────────────────────────────────────────────
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -28,22 +31,22 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 RSS_SOURCES = [
     {"source_name": "연합뉴스", "url": "https://www.yna.co.kr/rss/entertainment.xml", "category": "celeb"},
     {"source_name": "한국경제", "url": "https://www.hankyung.com/feed/entertainment", "category": "celeb"},
-    {"source_name": "MBC", "url": "http://imnews.imbc.com/rss/news/news_06.xml", "category": "celeb"},
-    # 스포츠경향은 연예 안에서도 방송/음악/영화가 이미 나뉘어 있어 category 정확도가 높음
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_tv", "category": "show"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_music", "category": "music"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_movie", "category": "movie"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment", "category": "celeb"},
-
 ]
+# 팀원 A가 sources_rss.py에 추가한 소스 병합 (기존 리스트 정의와 분리된 별도 줄)
+RSS_SOURCES = RSS_SOURCES + EXTRA_RSS_SOURCES
 
 # ── ② 카테고리 세분화 규칙 (제목 키워드 매칭) ─────────────────────
 CATEGORY_RULES = [
-    ("music", ["신곡", "컴백", "앨범", "음원", "차트", "발매"]),
-    ("drama", ["드라마", "회차", "시청률", "종영", "첫방"]),
-    ("show", ["예능", "방송", "출연"]),
-    ("event", ["콘서트", "팬미팅", "시상식", "투어", "티켓"]),
-    ("movie", ["개봉", "박스오피스", "관객", "영화제"]),
+    ("music", ["신곡", "컴백", "앨범", "음원", "차트", "발매", "싱글"]),
+    ("drama", ["드라마", "회차", "시청률", "종영", "첫방", "본방",
+               "tvN", "JTBC", "넷플릭스", "티빙", "디즈니", "웨이브", "쿠팡플레이"]),
+    ("show", ["예능", "방송", "출연진", "MC", "라디오"]),
+    ("event", ["콘서트", "팬미팅", "시상식", "투어", "티켓", "무대"]),
+    ("movie", ["개봉", "박스오피스", "관객", "영화제", "감독", "천만"]),
     ("webtoon", ["웹툰", "웹소설", "드라마화", "영상화"]),
 ]
 
@@ -51,6 +54,7 @@ CATEGORY_RULES = [
 IRRELEVANT_KEYWORDS = [
     "부고", "공정위", "선관위", "기후부", "수해", "단속", "지원금",
     "국정감사", "성명", "규탄", "집회", "판결", "검찰", "구속",
+    "[포토]",
 ]
 
 
@@ -88,9 +92,10 @@ def get_or_create_source_id(conn, name: str) -> int:
 
 def fetch_articles():
     """④ RSS 실제 호출 + 무관 기사 필터링"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     articles = []
     for source in RSS_SOURCES:
-        feed = feedparser.parse(source["url"])
+        feed = feedparser.parse(source["url"], request_headers=headers)
         for entry in feed.entries[:50]:
             if not is_relevant(entry.title):
                 continue
@@ -156,14 +161,21 @@ def main():
     conn = psycopg.connect(DATABASE_URL)
     fetched, inserted, duplicates, skipped = 0, 0, 0, 0
 
-    # 소스 이름 → source_id 미리 준비 (RSS_SOURCES에 등장하는 것들)
+    # 소스 이름 → source_id 미리 준비 (RSS 소스만; 네이버는 별도 처리)
     source_ids = {}
     with conn:
         for source in RSS_SOURCES:
             source_ids[source["source_name"]] = get_or_create_source_id(conn, source["source_name"])
+        source_ids["네이버뉴스"] = get_or_create_source_id(conn, "네이버뉴스")
 
+        # RSS 수집
         articles = fetch_articles()
-        print(f"RSS에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
+
+        # 네이버 API 수집 (팀원 B, NAVER_SEARCH_QUERIES가 비어있으면 자동으로 건너뜀)
+        for q in NAVER_SEARCH_QUERIES:
+            articles += fetch_naver_news(q["query"], q["category"])
+
+        print(f"RSS+네이버에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
 
         for i, article in enumerate(articles, 1):
             fetched += 1
