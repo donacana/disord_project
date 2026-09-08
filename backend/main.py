@@ -34,7 +34,7 @@ def health():
     try:
         db.fetch_one('SELECT 1 AS ok')
     except db.DatabaseError as error:
-        logger.warning('%s', error)
+        logger.warning('Health check database error: %s; original=%r', error, error.__cause__ or error)
         return JSONResponse(status_code=503, content={
             'status': 'error', 'api': 'ok', 'database': 'error',
         })

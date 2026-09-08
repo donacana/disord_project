@@ -19,10 +19,9 @@ def get_connection():
     try:
         return psycopg.connect(
             url, connect_timeout=10, row_factory=dict_row,
-            options='-c statement_timeout=10000',
         )
-    except psycopg.Error:
-        raise DatabaseError('DB 연결 실패: DATABASE_URL, 인증 정보 및 네트워크를 확인하세요.') from None
+    except psycopg.Error as error:
+        raise DatabaseError('DB 연결 실패: DATABASE_URL, 인증 정보 및 네트워크를 확인하세요.') from error
 
 
 def fetch_one(query: str):
@@ -31,8 +30,8 @@ def fetch_one(query: str):
             with connection.cursor() as cursor:
                 cursor.execute(query)
                 return cursor.fetchone()
-    except psycopg.Error:
-        raise DatabaseError('DB 쿼리 실행 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
+    except psycopg.Error as error:
+        raise DatabaseError('DB 쿼리 실행 실패: 연결 상태와 기존 테이블을 확인하세요.') from error
 
 
 def fetch_all(query: str, params: tuple = ()) -> list[dict]:
@@ -41,8 +40,8 @@ def fetch_all(query: str, params: tuple = ()) -> list[dict]:
             with connection.cursor() as cursor:
                 cursor.execute(query, params)
                 return cursor.fetchall()
-    except psycopg.Error:
-        raise DatabaseError('DB 검색 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
+    except psycopg.Error as error:
+        raise DatabaseError('DB 검색 실패: 연결 상태와 기존 테이블을 확인하세요.') from error
 
 
 def execute(query: str, params: tuple = ()) -> None:
@@ -50,5 +49,5 @@ def execute(query: str, params: tuple = ()) -> None:
         with get_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(query, params)
-    except psycopg.Error:
-        raise DatabaseError('DB 기록 실패: 연결 상태와 기존 테이블을 확인하세요.') from None
+    except psycopg.Error as error:
+        raise DatabaseError('DB 기록 실패: 연결 상태와 기존 테이블을 확인하세요.') from error
