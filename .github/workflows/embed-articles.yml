@@ -30,4 +30,5 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           cd backend
-          python embed_articles.py --limit 10
+          python embed_articles.py --limit 200
+          
