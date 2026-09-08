@@ -10,7 +10,6 @@ import hashlib
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-
 import feedparser
 import trafilatura
 import psycopg
@@ -35,6 +34,7 @@ RSS_SOURCES = [
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_music", "category": "music"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_movie", "category": "movie"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment", "category": "celeb"},
+
 ]
 
 # ── ② 카테고리 세분화 규칙 (제목 키워드 매칭) ─────────────────────
@@ -91,17 +91,18 @@ def fetch_articles():
     articles = []
     for source in RSS_SOURCES:
         feed = feedparser.parse(source["url"])
-        for entry in feed.entries[:30]:
+        for entry in feed.entries[:50]:
             if not is_relevant(entry.title):
                 continue
             articles.append({
                 "title": entry.title,
                 "url": entry.link,
-                "published_at": entry.get("published") or datetime.now().isoformat(),  # ← 수정
+                "published_at": entry.get("published") or datetime.now().isoformat(),
                 "source_name": source["source_name"],
                 "category": guess_category(entry.title, source["category"]),
             })
     return articles
+
 
 def extract_content(url: str):
     """⑤ 기사 본문 추출"""
