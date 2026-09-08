@@ -1,6 +1,11 @@
 import os
+from pathlib import Path
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+
+load_dotenv(Path(__file__).with_name('.env'))
 
 
 class OpenAIServiceError(RuntimeError):
@@ -28,6 +33,48 @@ def embed_question(question: str) -> list[float]:
         raise
     except Exception as error:
         raise OpenAIServiceError('질문 임베딩 생성에 실패했습니다.') from error
+
+
+def embed_articles(texts: list[str]) -> list[list[float]]:
+    cleaned_texts = [
+        text.strip()
+        for text in texts
+    ]
+
+    if not cleaned_texts:
+        raise OpenAIServiceError('임베딩할 기사 텍스트가 없습니다.')
+
+    if any(not text for text in cleaned_texts):
+        raise OpenAIServiceError('빈 기사 텍스트는 임베딩할 수 없습니다.')
+
+    try:
+        response = _client().embeddings.create(
+            model='text-embedding-3-small',
+            input=cleaned_texts,
+        )
+
+        ordered_data = sorted(
+            response.data,
+            key=lambda item: item.index,
+        )
+
+        embeddings = [
+            item.embedding
+            for item in ordered_data
+        ]
+
+        if len(embeddings) != len(cleaned_texts):
+            raise OpenAIServiceError('기사 수와 임베딩 수가 일치하지 않습니다.')
+
+        if any(len(embedding) != 1536 for embedding in embeddings):
+            raise OpenAIServiceError('기사 임베딩 차원이 1536이 아닙니다.')
+
+        return embeddings
+
+    except OpenAIServiceError:
+        raise
+    except Exception as error:
+        raise OpenAIServiceError('기사 임베딩 생성에 실패했습니다.') from error
 
 
 def generate_answer(question: str, context: str) -> str:
