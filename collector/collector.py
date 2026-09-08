@@ -1,8 +1,11 @@
 """
-연예·문화 뉴스 수집기
+연예·문화 뉴스 수집기 (RSS 전용)
     python collector/collector.py
 
-흐름: RSS 호출 → 본문 추출 → 무관 기사 필터 → 중복 체크 → DB 저장 → 임베딩 생성
+네이버 API 수집은 별도 프로그램(sources_naver.py)에서 독립적으로 실행됨.
+    python collector/sources_naver.py
+
+흐름: RSS 호출 → 본문 추출 → 무관 기사 필터 → 중복 체크 → DB 저장
 """
 
 import os
@@ -16,12 +19,10 @@ import psycopg
 from dotenv import load_dotenv
 
 from sources_rss import EXTRA_RSS_SOURCES
-from sources_naver import fetch_naver_news, NAVER_SEARCH_QUERIES
 
 # ── 환경변수 로드 ──────────────────────────────────────────────
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
-# OPENAI_API_KEY는 이제 여기서 안 씀 — 임베딩은 backend/embed_articles.py가 담당
 
 # ── ① 수집 소스 목록 ────────────────────────────────────────────
 # 연예 전용 RSS만 사용 (culture.xml처럼 범위 넓은 피드는 무관 기사가 섞여 제외)
@@ -144,21 +145,13 @@ def main():
     conn = psycopg.connect(DATABASE_URL)
     fetched, inserted, duplicates, skipped = 0, 0, 0, 0
 
-    # 소스 이름 → source_id 미리 준비 (RSS 소스만; 네이버는 별도 처리)
     source_ids = {}
     with conn:
         for source in RSS_SOURCES:
             source_ids[source["source_name"]] = get_or_create_source_id(conn, source["source_name"])
-        source_ids["네이버뉴스"] = get_or_create_source_id(conn, "네이버뉴스")
 
-        # RSS 수집
         articles = fetch_articles()
-
-        # 네이버 API 수집 (팀원 B, NAVER_SEARCH_QUERIES가 비어있으면 자동으로 건너뜀)
-        for q in NAVER_SEARCH_QUERIES:
-            articles += fetch_naver_news(q["query"], q["category"])
-
-        print(f"RSS+네이버에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
+        print(f"RSS에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
 
         for i, article in enumerate(articles, 1):
             fetched += 1
