@@ -1,4 +1,3 @@
-# check_articles.py
 from dotenv import load_dotenv
 import os, psycopg
 
@@ -8,4 +7,6 @@ cur = conn.cursor()
 cur.execute("SELECT count(*) FROM articles")
 print("전체 기사 수:", cur.fetchone()[0])
 cur.execute("SELECT category, count(*) FROM articles GROUP BY category ORDER BY 2 DESC")
+print(cur.fetchall())
+cur.execute("SELECT DISTINCT source_name FROM articles")
 print(cur.fetchall())

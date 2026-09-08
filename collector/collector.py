@@ -28,31 +28,28 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 RSS_SOURCES = [
     {"source_name": "연합뉴스", "url": "https://www.yna.co.kr/rss/entertainment.xml", "category": "celeb"},
     {"source_name": "한국경제", "url": "https://www.hankyung.com/feed/entertainment", "category": "celeb"},
-    {"source_name": "MBC", "url": "http://imnews.imbc.com/rss/news/news_06.xml", "category": "celeb"},
-    # 스포츠경향은 연예 안에서도 방송/음악/영화가 이미 나뉘어 있어 category 정확도가 높음
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_tv", "category": "show"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_music", "category": "music"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_movie", "category": "movie"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment", "category": "celeb"},
-
 ]
 
 # ── ② 카테고리 세분화 규칙 (제목 키워드 매칭) ─────────────────────
 CATEGORY_RULES = [
-    ("music", ["신곡", "컴백", "앨범", "음원", "차트", "발매"]),
-    ("drama", ["드라마", "회차", "시청률", "종영", "첫방"]),
-    ("show", ["예능", "방송", "출연"]),
-    ("event", ["콘서트", "팬미팅", "시상식", "투어", "티켓"]),
-    ("movie", ["개봉", "박스오피스", "관객", "영화제"]),
+    ("music", ["신곡", "컴백", "앨범", "음원", "차트", "발매", "싱글"]),
+    ("drama", ["드라마", "회차", "시청률", "종영", "첫방", "본방",
+               "tvN", "JTBC", "넷플릭스", "티빙", "디즈니", "웨이브", "쿠팡플레이"]),
+    ("show", ["예능", "방송", "출연진", "MC", "라디오"]),
+    ("event", ["콘서트", "팬미팅", "시상식", "투어", "티켓", "무대"]),
+    ("movie", ["개봉", "박스오피스", "관객", "영화제", "감독", "천만"]),
     ("webtoon", ["웹툰", "웹소설", "드라마화", "영상화"]),
 ]
-
 # ── ③ 명백히 무관한 기사 걸러내기 (부고/행정/사회 뉴스 등) ─────────
 IRRELEVANT_KEYWORDS = [
     "부고", "공정위", "선관위", "기후부", "수해", "단속", "지원금",
     "국정감사", "성명", "규탄", "집회", "판결", "검찰", "구속",
+    "[포토]",
 ]
-
 
 def is_relevant(title: str) -> bool:
     return not any(k in title for k in IRRELEVANT_KEYWORDS)
@@ -88,9 +85,10 @@ def get_or_create_source_id(conn, name: str) -> int:
 
 def fetch_articles():
     """④ RSS 실제 호출 + 무관 기사 필터링"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     articles = []
     for source in RSS_SOURCES:
-        feed = feedparser.parse(source["url"])
+        feed = feedparser.parse(source["url"], request_headers=headers)
         for entry in feed.entries[:50]:
             if not is_relevant(entry.title):
                 continue
