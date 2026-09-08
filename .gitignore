@@ -1,4 +1,13 @@
+# Environment variables
 .env
+**/.env
+
+# Python
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+.venv/
+**/.venv/
+
+# PyCharm
 .idea/

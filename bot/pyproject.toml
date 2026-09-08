@@ -1,0 +1,10 @@
+[project]
+name = "discord-rag-bot"
+version = "0.1.0"
+description = "Entertainment Culture RAG Discord Bot"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.6.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.1.0",
+]
