@@ -183,8 +183,8 @@ def parse_args() -> argparse.Namespace:
 if __name__ == '__main__':
     args = parse_args()
 
-    if args.limit < 1 or args.limit > 100:
-        print('--limit은 1부터 100 사이여야 합니다.')
+    if args.limit < 1:
+        print('--limit은 1 이상이어야 합니다.')
         sys.exit(1)
 
     run(args.limit)
