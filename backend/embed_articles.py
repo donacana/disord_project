@@ -8,7 +8,7 @@ from openai_client import OpenAIServiceError, embed_articles
 
 EMBEDDING_MODEL = 'text-embedding-3-small'
 MAX_EMBEDDING_CHARS = 12000
-BATCH_SIZE = 50
+BATCH_SIZE = 10
 
 
 PENDING_ARTICLES_QUERY = """
