@@ -157,6 +157,155 @@ def get_pending_count() -> int:
     ) if row else 0
 
 
+def embed_single_article(
+    article: dict,
+) -> bool:
+    """
+    기사 1건만 개별 임베딩한다.
+    성공하면 True, 실패하면 False.
+    """
+
+    try:
+        text = build_embedding_text(
+            article
+        )
+
+        if not text:
+            print(
+                f'[SKIP] article_id={article["id"]} '
+                f'임베딩할 텍스트가 없습니다.'
+            )
+            return False
+
+        embeddings = embed_articles(
+            [text]
+        )
+
+        saved_count = save_embeddings(
+            [article],
+            embeddings,
+        )
+
+        if saved_count == 1:
+            print(
+                f'[개별 성공] '
+                f'article_id={article["id"]}'
+            )
+            return True
+
+        print(
+            f'[개별 저장 실패] '
+            f'article_id={article["id"]}'
+        )
+
+        return False
+
+    except (
+        db.DatabaseError,
+        OpenAIServiceError,
+    ) as error:
+        print(
+            f'[개별 실패 SKIP] '
+            f'article_id={article["id"]} '
+            f'오류={error}'
+        )
+
+        return False
+
+
+def process_batch(
+    batch_articles: list[dict],
+    start_index: int,
+    total_articles: int,
+) -> tuple[int, int]:
+    """
+    배치 전체를 먼저 임베딩한다.
+
+    배치 성공:
+        그대로 저장.
+
+    배치 실패:
+        해당 배치만 기사별로 재시도한다.
+
+    반환:
+        (성공 건수, 실패 건수)
+    """
+
+    texts = [
+        build_embedding_text(article)
+        for article in batch_articles
+    ]
+
+    try:
+        embeddings = embed_articles(
+            texts
+        )
+
+        saved_count = save_embeddings(
+            batch_articles,
+            embeddings,
+        )
+
+        end_index = (
+            start_index
+            + len(batch_articles)
+            - 1
+        )
+
+        print(
+            f'[배치 성공] '
+            f'{start_index}~{end_index} / '
+            f'{total_articles} '
+            f'저장={saved_count}건'
+        )
+
+        return (
+            saved_count,
+            len(batch_articles) - saved_count,
+        )
+
+    except (
+        db.DatabaseError,
+        OpenAIServiceError,
+    ) as error:
+        end_index = (
+            start_index
+            + len(batch_articles)
+            - 1
+        )
+
+        print(
+            f'[배치 실패] '
+            f'{start_index}~{end_index} / '
+            f'{total_articles}'
+        )
+
+        print(
+            f'원인: {error}'
+        )
+
+        print(
+            '해당 배치를 기사별로 다시 처리합니다.'
+        )
+
+        success_count = 0
+        failed_count = 0
+
+        for article in batch_articles:
+
+            if embed_single_article(
+                article
+            ):
+                success_count += 1
+            else:
+                failed_count += 1
+
+        return (
+            success_count,
+            failed_count,
+        )
+
+
 def run(limit: int) -> None:
     articles = fetch_pending_articles(
         limit
@@ -170,88 +319,86 @@ def run(limit: int) -> None:
 
     total_articles = len(articles)
     total_saved = 0
+    total_failed = 0
 
+    print('=' * 60)
     print(
         f'임베딩 대상: {total_articles}건'
     )
-
     print(
         f'배치 크기: {BATCH_SIZE}건'
     )
+    print('=' * 60)
 
-    try:
-        for start in range(
-            0,
+    for start in range(
+        0,
+        total_articles,
+        BATCH_SIZE,
+    ):
+        end = min(
+            start + BATCH_SIZE,
             total_articles,
-            BATCH_SIZE,
-        ):
-            end = min(
-                start + BATCH_SIZE,
-                total_articles,
-            )
-
-            batch_articles = articles[
-                start:end
-            ]
-
-            texts = [
-                build_embedding_text(
-                    article
-                )
-                for article in batch_articles
-            ]
-
-            print(
-                f'임베딩 요청: '
-                f'{start + 1}~{end} / '
-                f'{total_articles}'
-            )
-
-            embeddings = embed_articles(
-                texts
-            )
-
-            saved_count = save_embeddings(
-                batch_articles,
-                embeddings,
-            )
-
-            total_saved += saved_count
-
-            print(
-                f'배치 저장 완료: '
-                f'{saved_count}건 '
-                f'({start + 1}~{end})'
-            )
-
-    except (
-        db.DatabaseError,
-        OpenAIServiceError,
-    ) as error:
-        print(
-            f'임베딩 처리 실패: {error}'
         )
 
+        batch_articles = articles[
+            start:end
+        ]
+
+        print()
         print(
-            f'실패 전 저장 완료: '
+            f'임베딩 요청: '
+            f'{start + 1}~{end} / '
+            f'{total_articles}'
+        )
+
+        saved_count, failed_count = (
+            process_batch(
+                batch_articles,
+                start + 1,
+                total_articles,
+            )
+        )
+
+        total_saved += saved_count
+        total_failed += failed_count
+
+        print(
+            f'현재 누적 저장: '
             f'{total_saved}건'
         )
 
-        sys.exit(1)
+        print(
+            f'현재 누적 실패: '
+            f'{total_failed}건'
+        )
 
-    pending_count = get_pending_count()
+    try:
+        pending_count = get_pending_count()
+    except db.DatabaseError as error:
+        print(
+            f'남은 기사 수 조회 실패: {error}'
+        )
+        pending_count = -1
 
     print()
-    print('=' * 50)
+    print('=' * 60)
+    print('기사 임베딩 처리 완료')
     print(
         f'임베딩 저장 완료: '
         f'{total_saved}건'
     )
     print(
-        f'남은 미처리 기사: '
-        f'{pending_count}건'
+        f'임베딩 실패/건너뜀: '
+        f'{total_failed}건'
     )
-    print('=' * 50)
+
+    if pending_count >= 0:
+        print(
+            f'남은 미처리 기사: '
+            f'{pending_count}건'
+        )
+
+    print('=' * 60)
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,7 +428,6 @@ if __name__ == '__main__':
         print(
             '--limit은 1 이상이어야 합니다.'
         )
-
         sys.exit(1)
 
     run(
