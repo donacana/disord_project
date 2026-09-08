@@ -1,13 +1,14 @@
 # Backend API
 
-Python 3.10 이상. FastAPI + Neon PostgreSQL 연결 골격입니다.
-기존 DB 테이블을 조회하며 스키마 생성/변경이나 데이터 INSERT는 하지 않습니다.
-실제 RAG, OpenAI, 임베딩 검색, Bot, 수집 기능은 포함하지 않습니다.
+Python 3.10 이상. FastAPI + Neon PostgreSQL 기반 RAG API입니다.
+기존 DB 테이블을 조회하며 스키마 생성/변경이나 기사 데이터 INSERT는 하지 않습니다.
+질문 임베딩, pgvector cosine 검색, 검색 context 기반 답변 생성을 제공합니다.
+기사 임베딩 적재, Bot, 수집 기능은 포함하지 않습니다.
 
 ## Windows 실행 (PowerShell)
 
 ```powershell
-cd C:\jtkproject\9-8\backend
+cd C:\jtkproject\discordproject\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
@@ -48,7 +49,9 @@ Invoke-RestMethod http://127.0.0.1:8000/ask -Method Post -ContentType 'applicati
 
 - `/health`: SELECT 1 성공 시 HTTP 200과 status/api/database = ok. DB 실패 시 HTTP 503과 status=error, api=ok, database=error.
 - `/stats`: total_articles, total_embeddings, last_collected_at, source_count 반환. 빈 테이블에서는 0, 0, null, 0입니다. DB/테이블 조회 실패는 HTTP 503입니다.
-- `/ask`: 임시 답변, sources=[], domain=ent_culture. DB 연결 없이도 동작합니다.
+- `/ask`: 질문을 임베딩한 뒤 기존 article_embeddings를 cosine 검색하고, 검색 기사만 LLM context로 전달합니다. 결과 URL은 articles.url에서 반환합니다.
+- 검색 결과가 없으면 `현재 수집된 자료에서 관련 정보를 찾지 못했습니다.`를 반환하고 LLM을 호출하지 않습니다.
+- `OPENAI_CHAT_MODEL`은 기본값 `gpt-4o-mini`, `RAG_MIN_SIMILARITY`는 기본값 `0.3`입니다.
 - question 누락/빈 문자열/공백만 입력, top_k 1~10 범위 밖 입력은 HTTP 422입니다. top_k 생략 시 5입니다.
 
 기존 public.articles, public.article_embeddings, public.sources가 있어야 합니다.
