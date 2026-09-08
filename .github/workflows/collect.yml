@@ -14,8 +14,16 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: python collector/collector.py
+
+      - name: RSS 수집
+        run: python collector/collector.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          NCLOUD_ACCESS_KEY: ${{ secrets.NCLOUD_ACCESS_KEY }}
-          NCLOUD_SECRET_KEY: ${{ secrets.NCLOUD_SECRET_KEY }}
+
+      - name: 네이버 수집
+        run: python collector/sources_naver.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        continue-on-error: true   # 네이버 키가 아직 없거나 실패해도 RSS 수집은 항상 성공 처리
