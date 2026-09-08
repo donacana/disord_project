@@ -8,6 +8,8 @@ from openai_client import OpenAIServiceError, embed_articles
 
 EMBEDDING_MODEL = 'text-embedding-3-small'
 MAX_EMBEDDING_CHARS = 12000
+BATCH_SIZE = 50
+
 
 PENDING_ARTICLES_QUERY = """
 SELECT
@@ -25,6 +27,7 @@ ORDER BY a.id
 LIMIT %s
 """
 
+
 SAVE_EMBEDDING_QUERY = """
 INSERT INTO public.article_embeddings (
     article_id,
@@ -40,11 +43,13 @@ DO UPDATE SET
     created_at = NOW()
 """
 
+
 MARK_EMBEDDED_QUERY = """
 UPDATE public.articles
 SET is_embedded = TRUE
 WHERE id = %s
 """
+
 
 PENDING_COUNT_QUERY = """
 SELECT COUNT(*) AS count
@@ -69,20 +74,28 @@ def build_embedding_text(article: dict[str, Any]) -> str:
     ]
 
     keywords = article.get('keywords') or []
+
     if keywords:
         parts.append(
             '키워드: ' + ', '.join(keywords)
         )
 
     summary = (article.get('summary') or '').strip()
+
     if summary:
-        parts.append(f'요약: {summary}')
+        parts.append(
+            f'요약: {summary}'
+        )
 
     content = (article.get('content') or '').strip()
+
     if content:
-        parts.append(f'본문: {content}')
+        parts.append(
+            f'본문: {content}'
+        )
 
     text = '\n'.join(parts).strip()
+
     return text[:MAX_EMBEDDING_CHARS]
 
 
@@ -102,6 +115,7 @@ def save_embeddings(
     try:
         with db.get_connection() as connection:
             with connection.cursor() as cursor:
+
                 for article, embedding in zip(
                     articles,
                     embeddings,
@@ -115,10 +129,14 @@ def save_embeddings(
                             EMBEDDING_MODEL,
                         ),
                     )
+
                     cursor.execute(
                         MARK_EMBEDDED_QUERY,
-                        (article['id'],),
+                        (
+                            article['id'],
+                        ),
                     )
+
                     saved_count += 1
 
         return saved_count
@@ -130,53 +148,129 @@ def save_embeddings(
 
 
 def get_pending_count() -> int:
-    row = db.fetch_one(PENDING_COUNT_QUERY)
-    return int(row['count']) if row else 0
+    row = db.fetch_one(
+        PENDING_COUNT_QUERY
+    )
+
+    return int(
+        row['count']
+    ) if row else 0
 
 
 def run(limit: int) -> None:
-    articles = fetch_pending_articles(limit)
+    articles = fetch_pending_articles(
+        limit
+    )
 
     if not articles:
-        print('임베딩할 기사가 없습니다.')
+        print(
+            '임베딩할 기사가 없습니다.'
+        )
         return
 
-    print(f'임베딩 대상: {len(articles)}건')
+    total_articles = len(articles)
+    total_saved = 0
 
-    texts = [
-        build_embedding_text(article)
-        for article in articles
-    ]
+    print(
+        f'임베딩 대상: {total_articles}건'
+    )
+
+    print(
+        f'배치 크기: {BATCH_SIZE}건'
+    )
 
     try:
-        embeddings = embed_articles(texts)
-        saved_count = save_embeddings(
-            articles,
-            embeddings,
-        )
+        for start in range(
+            0,
+            total_articles,
+            BATCH_SIZE,
+        ):
+            end = min(
+                start + BATCH_SIZE,
+                total_articles,
+            )
+
+            batch_articles = articles[
+                start:end
+            ]
+
+            texts = [
+                build_embedding_text(
+                    article
+                )
+                for article in batch_articles
+            ]
+
+            print(
+                f'임베딩 요청: '
+                f'{start + 1}~{end} / '
+                f'{total_articles}'
+            )
+
+            embeddings = embed_articles(
+                texts
+            )
+
+            saved_count = save_embeddings(
+                batch_articles,
+                embeddings,
+            )
+
+            total_saved += saved_count
+
+            print(
+                f'배치 저장 완료: '
+                f'{saved_count}건 '
+                f'({start + 1}~{end})'
+            )
+
     except (
         db.DatabaseError,
         OpenAIServiceError,
     ) as error:
-        print(f'임베딩 처리 실패: {error}')
+        print(
+            f'임베딩 처리 실패: {error}'
+        )
+
+        print(
+            f'실패 전 저장 완료: '
+            f'{total_saved}건'
+        )
+
         sys.exit(1)
 
     pending_count = get_pending_count()
 
-    print(f'임베딩 저장 완료: {saved_count}건')
-    print(f'남은 미처리 기사: {pending_count}건')
+    print()
+    print('=' * 50)
+    print(
+        f'임베딩 저장 완료: '
+        f'{total_saved}건'
+    )
+    print(
+        f'남은 미처리 기사: '
+        f'{pending_count}건'
+    )
+    print('=' * 50)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='미처리 기사의 임베딩을 생성합니다.',
+        description=(
+            '미처리 기사의 임베딩을 생성합니다.'
+        ),
     )
+
     parser.add_argument(
         '--limit',
         type=int,
         default=20,
-        help='한 번에 처리할 최대 기사 수',
+        help=(
+            '이번 실행에서 처리할 '
+            '최대 기사 수'
+        ),
     )
+
     return parser.parse_args()
 
 
@@ -184,7 +278,12 @@ if __name__ == '__main__':
     args = parse_args()
 
     if args.limit < 1:
-        print('--limit은 1 이상이어야 합니다.')
+        print(
+            '--limit은 1 이상이어야 합니다.'
+        )
+
         sys.exit(1)
 
-    run(args.limit)
+    run(
+        args.limit
+    )
