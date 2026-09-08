@@ -16,6 +16,9 @@ import psycopg
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from sources_rss import EXTRA_RSS_SOURCES
+from sources_naver import fetch_naver_news, NAVER_SEARCH_QUERIES
+
 # ── 환경변수 로드 ──────────────────────────────────────────────
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -33,6 +36,8 @@ RSS_SOURCES = [
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment_movie", "category": "movie"},
     {"source_name": "스포츠경향", "url": "https://sports.khan.co.kr/rss/entertainment", "category": "celeb"},
 ]
+# 팀원 A가 sources_rss.py에 추가한 소스 병합 (기존 리스트 정의와 분리된 별도 줄)
+RSS_SOURCES = RSS_SOURCES + EXTRA_RSS_SOURCES
 
 # ── ② 카테고리 세분화 규칙 (제목 키워드 매칭) ─────────────────────
 CATEGORY_RULES = [
@@ -44,12 +49,14 @@ CATEGORY_RULES = [
     ("movie", ["개봉", "박스오피스", "관객", "영화제", "감독", "천만"]),
     ("webtoon", ["웹툰", "웹소설", "드라마화", "영상화"]),
 ]
+
 # ── ③ 명백히 무관한 기사 걸러내기 (부고/행정/사회 뉴스 등) ─────────
 IRRELEVANT_KEYWORDS = [
     "부고", "공정위", "선관위", "기후부", "수해", "단속", "지원금",
     "국정감사", "성명", "규탄", "집회", "판결", "검찰", "구속",
     "[포토]",
 ]
+
 
 def is_relevant(title: str) -> bool:
     return not any(k in title for k in IRRELEVANT_KEYWORDS)
@@ -154,14 +161,21 @@ def main():
     conn = psycopg.connect(DATABASE_URL)
     fetched, inserted, duplicates, skipped = 0, 0, 0, 0
 
-    # 소스 이름 → source_id 미리 준비 (RSS_SOURCES에 등장하는 것들)
+    # 소스 이름 → source_id 미리 준비 (RSS 소스만; 네이버는 별도 처리)
     source_ids = {}
     with conn:
         for source in RSS_SOURCES:
             source_ids[source["source_name"]] = get_or_create_source_id(conn, source["source_name"])
+        source_ids["네이버뉴스"] = get_or_create_source_id(conn, "네이버뉴스")
 
+        # RSS 수집
         articles = fetch_articles()
-        print(f"RSS에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
+
+        # 네이버 API 수집 (팀원 B, NAVER_SEARCH_QUERIES가 비어있으면 자동으로 건너뜀)
+        for q in NAVER_SEARCH_QUERIES:
+            articles += fetch_naver_news(q["query"], q["category"])
+
+        print(f"RSS+네이버에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
 
         for i, article in enumerate(articles, 1):
             fetched += 1
