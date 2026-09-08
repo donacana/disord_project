@@ -3,3 +3,4 @@ trafilatura
 psycopg[binary]
 openai
 python-dotenv
+requests
