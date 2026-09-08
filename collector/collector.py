@@ -14,7 +14,6 @@ import feedparser
 import trafilatura
 import psycopg
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from sources_rss import EXTRA_RSS_SOURCES
 from sources_naver import fetch_naver_news, NAVER_SEARCH_QUERIES
@@ -22,9 +21,7 @@ from sources_naver import fetch_naver_news, NAVER_SEARCH_QUERIES
 # ── 환경변수 로드 ──────────────────────────────────────────────
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # 없으면 임베딩 단계 건너뜀
-
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# OPENAI_API_KEY는 이제 여기서 안 씀 — 임베딩은 backend/embed_articles.py가 담당
 
 # ── ① 수집 소스 목록 ────────────────────────────────────────────
 # 연예 전용 RSS만 사용 (culture.xml처럼 범위 넓은 피드는 무관 기사가 섞여 제외)
@@ -117,16 +114,10 @@ def extract_content(url: str):
     return trafilatura.extract(downloaded)
 
 
-def embed(text: str):
-    """⑥ 임베딩 생성 — API 키 없으면 건너뜀"""
-    if client is None:
-        return None
-    resp = client.embeddings.create(model="text-embedding-3-small", input=text[:8000])
-    return resp.data[0].embedding
-
-
 def save_article(conn, article: dict, content: str, source_id: int):
-    """⑦ DB 저장 — url_hash UNIQUE라 중복이면 조용히 무시"""
+    """⑥ DB 저장 — url_hash UNIQUE라 중복이면 조용히 무시
+    임베딩은 여기서 만들지 않음 — backend/embed_articles.py가 배치로 처리함
+    """
     h = url_hash(article["url"])
     with conn.cursor() as cur:
         cur.execute(
@@ -146,15 +137,7 @@ def save_article(conn, article: dict, content: str, source_id: int):
         row = cur.fetchone()
         if row is None:
             return None
-        article_id = row[0]
-
-        vec = embed(f"{article['title']}\n\n{content[:1500]}")
-        if vec is not None:
-            cur.execute(
-                "INSERT INTO article_embeddings (article_id, embedding) VALUES (%s, %s)",
-                (article_id, vec),
-            )
-        return article_id
+        return row[0]
 
 
 def main():
