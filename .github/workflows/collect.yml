@@ -1,0 +1,21 @@
+name: collect
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00
+  workflow_dispatch:        # 수동 실행 버튼도 생김
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python collector/collector.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NCLOUD_ACCESS_KEY: ${{ secrets.NCLOUD_ACCESS_KEY }}
+          NCLOUD_SECRET_KEY: ${{ secrets.NCLOUD_SECRET_KEY }}
