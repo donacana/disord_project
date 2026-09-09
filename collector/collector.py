@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 from sources_rss import EXTRA_RSS_SOURCES
 from keyword_extractor import extract_keywords
+from sources_public_event import fetch_public_events
 
 import feedparser
 import trafilatura
@@ -152,17 +153,26 @@ def main():
     with conn:
         for source in RSS_SOURCES:
             source_ids[source["source_name"]] = get_or_create_source_id(conn, source["source_name"])
+        source_ids["문화포털"] = get_or_create_source_id(conn, "문화포털")   # ← 이 줄 추가
 
         articles = fetch_articles()
-        print(f"RSS에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
+        articles += fetch_public_events()
+        for a in articles:
+            if "keywords" not in a:
+                a["keywords"] = []
+        print(f"RSS+공공행사에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
 
         for i, article in enumerate(articles, 1):
             fetched += 1
-            content = extract_content(article["url"])
-            if not content or len(content) < 200:
-                skipped += 1
-                print(f"[{i}/{len(articles)}] 본문 부족, 건너뜀: {article['title'][:30]}")
-                continue
+            pre_filled = article.get("content")
+            if pre_filled:
+                content = pre_filled  # 공공 API 등이 이미 완성해서 준 본문은 길이 검사 안 함
+            else:
+                content = extract_content(article["url"])
+                if not content or len(content) < 200:
+                    skipped += 1
+                    print(f"[{i}/{len(articles)}] 본문 부족, 건너뜀: {article['title'][:30]}")
+                    continue
 
             source_id = source_ids[article["source_name"]]
             article_id = save_article(conn, article, content, source_id)
