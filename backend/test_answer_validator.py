@@ -192,6 +192,34 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([call.kwargs['model'] for call in client.chat.completions.create.call_args_list],
                          ['configured-model', 'configured-model'])
 
+    def test_answer_prompts_allow_grounded_detail(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=SUPPORTED))])
+        with patch.object(openai_client, '_client', return_value=client):
+            openai_client.generate_answer('테스트그룹 최근 활동', EVIDENCE)
+            openai_client.verify_answer('테스트그룹 최근 활동', EVIDENCE, SUPPORTED)
+        generation_prompt = client.chat.completions.create.call_args_list[0].kwargs['messages'][0]['content']
+        verification_prompt = client.chat.completions.create.call_args_list[1].kwargs['messages'][0]['content']
+        self.assertIn('최대 6개의 짧은 문장', generation_prompt)
+        self.assertIn('기사 제목을 그대로 반복하지 말고', generation_prompt)
+        self.assertIn('최대 6개까지 유지하라', verification_prompt)
+
+    def test_multiple_grounded_sentences_survive(self):
+        evidence = [
+            '테스트그룹은 새 앨범을 발매했습니다. 테스트그룹은 공연을 진행했습니다.',
+            '테스트그룹은 방송에 출연했습니다.',
+        ]
+        answer = ('테스트그룹은 새 앨범을 발매했습니다.[1]\n'
+                  '테스트그룹은 공연을 진행했습니다.[1]\n'
+                  '테스트그룹은 방송에 출연했습니다.[2]')
+        result = validate_answer(answer, evidence)
+        self.assertEqual(result.citation_ids, (1, 2))
+        self.assertEqual(len(result.answer.splitlines()), 3)
+        unsupported = validate_answer(answer + '\n테스트그룹은 세계 최고입니다.[1]', evidence)
+        self.assertEqual(len(unsupported.answer.splitlines()), 3)
+        self.assertTrue(unsupported.removed_sentences)
+
     def test_generation_failure_keeps_503_contract(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
                 patch.object(rag, 'generate_answer', side_effect=openai_client.OpenAIServiceError('failed')), \

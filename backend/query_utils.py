@@ -81,6 +81,7 @@ class QueryHints:
     categories: tuple[str, ...]
     strict_category: bool
     recent_days: int | None
+    search_queries: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class QueryAnalysis:
     intent: str
     time_range: str
     keywords: tuple[str, ...]
+    search_queries: tuple[str, ...]
     confidence: float
 
 
@@ -214,8 +216,22 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
     confidence = 0.9 if entity and intent != 'general' else 0.55 if entity else 0.4
     if any(term in compact for term in ('뭐함', '뭐해', '있음', '누군데')):
         confidence -= 0.15
-    return QueryAnalysis(question, normalized.strip(), entity, _canonical_intent(intent),
-                         _time_range(question), tuple(hints.keywords), max(0.0, confidence))
+    analysis_intent = _canonical_intent(intent)
+    fallback = QueryAnalysis(question, normalized.strip(), entity, analysis_intent,
+                             _time_range(question), tuple(hints.keywords), (),
+                             max(0.0, confidence))
+    return QueryAnalysis(fallback.original_question, fallback.normalized_question,
+                         fallback.entity, fallback.intent, fallback.time_range,
+                         fallback.keywords, _fallback_search_queries(fallback),
+                         fallback.confidence)
+
+
+def _fallback_search_queries(analysis: QueryAnalysis) -> tuple[str, ...]:
+    """Build bounded search queries only when LLM understanding falls back."""
+    subject = analysis.entity or ' '.join(analysis.keywords)
+    if not subject:
+        return () if analysis.intent == 'trend_ranking' else (analysis.original_question,)
+    return tuple(dict.fromkeys(expand_query(analysis.original_question, analysis)))[:6]
 
 
 def should_use_llm(analysis: QueryAnalysis) -> bool:
@@ -229,21 +245,28 @@ def should_use_llm(analysis: QueryAnalysis) -> bool:
 
 
 def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
-    entity = payload.get('entity')
-    entity = _alias(entity.strip()) if isinstance(entity, str) and entity.strip() else rule.entity
+    if 'entity' not in payload:
+        entity = rule.entity
+    else:
+        raw_entity = payload.get('entity')
+        entity = _alias(raw_entity.strip()) if isinstance(raw_entity, str) and raw_entity.strip() else None
     raw_intent = payload.get('intent')
     intent = rule.intent if not raw_intent else _canonical_intent(raw_intent)
     if raw_intent is None and rule.intent != 'general':
         intent = rule.intent
-    if rule.intent == 'trend_ranking' and intent == 'trend':
-        intent = 'trend_ranking'
     time_range = payload.get('time_range')
     if time_range not in ALLOWED_TIME_RANGES:
-        time_range = rule.time_range
+        time_range = rule.time_range if time_range is None else 'unknown'
     keywords = payload.get('keywords')
     if not isinstance(keywords, list) or not all(isinstance(item, str) for item in keywords):
         keywords = list(rule.keywords)
     keywords = tuple(dict.fromkeys(item.strip() for item in keywords if item.strip()))
+    raw_queries = payload.get('search_queries')
+    if not isinstance(raw_queries, list) or not all(isinstance(item, str) for item in raw_queries):
+        raw_queries = list(rule.search_queries)
+    search_queries = tuple(dict.fromkeys(item.strip() for item in raw_queries if item.strip()))[:6]
+    if not search_queries and intent != 'trend_ranking':
+        search_queries = _fallback_search_queries(rule)
     normalized = payload.get('normalized_question')
     if not isinstance(normalized, str) or not normalized.strip():
         normalized = rule.normalized_question
@@ -252,7 +275,7 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
     except (TypeError, ValueError):
         confidence = rule.confidence
     return QueryAnalysis(rule.original_question, normalized.strip(), entity, intent, time_range,
-                         keywords, confidence)
+                         keywords, search_queries, confidence)
 
 
 def analysis_to_hints(analysis: QueryAnalysis) -> QueryHints:
@@ -265,7 +288,8 @@ def analysis_to_hints(analysis: QueryAnalysis) -> QueryHints:
     recent_days = {'today': 1, 'week': 7, 'month': 30, 'recent': DEFAULT_RECENT_DAYS,
                    'year': 365}.get(analysis.time_range)
     return QueryHints(keywords, entities, legacy_intent if legacy_intent != 'general' else None,
-                      categories, legacy_intent in {'movie', 'movie_release', 'drama'}, recent_days)
+                      categories, legacy_intent in {'movie', 'movie_release', 'drama'},
+                      recent_days, analysis.search_queries)
 
 
 def extract_definition_entity(question: str) -> str | None:

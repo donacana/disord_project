@@ -136,7 +136,7 @@ class RetrievalTests(unittest.TestCase):
 
     def test_llm_query_analysis_json_and_failure(self):
         response = type('Response', (), {'choices': [type('Choice', (), {
-            'message': type('Message', (), {'content': '{"entity":"스트레이 키즈","intent":"activity","time_range":"recent","keywords":["앨범"],"normalized_question":"스트레이 키즈 최근 활동","confidence":0.92}'})()
+            'message': type('Message', (), {'content': '{"original_question":"스키즈 요즘 뭐함?","entity":"스트레이 키즈","intent":"activity","time_range":"recent","keywords":["앨범"],"search_queries":["스트레이 키즈 최근 활동","스트레이 키즈 앨범"],"normalized_question":"스트레이 키즈 최근 활동","confidence":0.92}'})()
         })()]})()
         client = type('Client', (), {'chat': type('Chat', (), {
             'completions': type('Completions', (), {'create': lambda self, **kwargs: response})()
@@ -150,10 +150,15 @@ class RetrievalTests(unittest.TestCase):
                 openai_client.analyze_question('스키즈 요즘 뭐함?')
 
     def test_query_understanding_is_rule_first_and_failure_safe(self):
-        with patch.object(openai_client, 'analyze_question') as analyze:
+        with patch.object(openai_client, 'analyze_question', return_value={
+            'original_question': '장원영 최근 활동 알려줘',
+            'entity': '장원영', 'intent': 'activity', 'time_range': 'recent',
+            'keywords': ['활동'], 'search_queries': ['장원영 최근 활동'],
+            'normalized_question': '장원영 최근 활동', 'confidence': 0.9,
+        }) as analyze:
             result, used = rag._query_analysis('장원영 최근 활동 알려줘')
-        analyze.assert_not_called()
-        self.assertFalse(used)
+        analyze.assert_called_once()
+        self.assertTrue(used)
         self.assertEqual((result.entity, result.intent), ('장원영', 'activity'))
 
         with patch.object(openai_client, 'analyze_question', return_value={
@@ -172,6 +177,17 @@ class RetrievalTests(unittest.TestCase):
             result, used = rag._query_analysis('스키즈 요즘 뭐함?')
         self.assertFalse(used)
         self.assertEqual((result.entity, result.intent), ('스트레이 키즈', 'activity'))
+
+    def test_low_confidence_uses_rule_fallback(self):
+        with patch.object(openai_client, 'analyze_question', return_value={
+            'original_question': '장원영 최근 활동 알려줘',
+            'entity': '장원영', 'intent': 'activity', 'time_range': 'recent',
+            'keywords': [], 'search_queries': ['장원영'],
+            'normalized_question': '장원영', 'confidence': 0.2,
+        }):
+            result, used = rag._query_analysis('장원영 최근 활동 알려줘')
+        self.assertFalse(used)
+        self.assertEqual((result.entity, result.intent), ('장원영', 'activity'))
 
     def test_activity_vs_controversy(self):
         rows = [article(1, '테스트가수 고소 사건 법원 판결', .8, '공연 이력'),

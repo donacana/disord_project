@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from backend import db, rag, trend_service
-from backend.query_utils import rule_query_analysis
+from backend.query_utils import QueryAnalysis, rule_query_analysis
 
 NOW = datetime(2026, 9, 9, tzinfo=timezone.utc)
 
@@ -61,7 +61,10 @@ class TrendRankingTests(unittest.TestCase):
 
     def test_trend_branch_keeps_api_shape_and_uses_no_vector_search(self):
         items = [trend_service.TrendItem('A그룹', 3, 2, NOW, .9, (row(1, 'A그룹 컴백', 'A'),))]
-        with patch.object(rag.trend_service, 'aggregate', return_value=(items, 3)), \
+        analysis = QueryAnalysis('요즘 누가 유명해?', '최근 화제 인물', None,
+                     'trend_ranking', 'recent', ('화제',), (), .9)
+        with patch.object(rag, '_query_analysis', return_value=(analysis, True)), \
+            patch.object(rag.trend_service, 'aggregate', return_value=(items, 3)), \
                 patch.object(rag, 'generate_trend_answer', return_value='최근 수집 기사 기준으로 A그룹이 3건으로 집계됐습니다.[1]'), \
                 patch.object(rag, '_search') as search, \
                 patch.object(db, 'execute'):

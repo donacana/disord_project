@@ -11,8 +11,7 @@ if __package__:
                                 generate_trend_answer, verify_answer)
     from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from .query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
-                               expand_query, merge_llm_analysis, rule_query_analysis,
-                               should_use_llm)
+                               expand_query, merge_llm_analysis, rule_query_analysis)
     from .retrieval import MIN_SIMILARITY, search
     from . import trend_service
     from .schemas import AskResponse, SourceItem
@@ -23,8 +22,7 @@ else:
                                generate_trend_answer, verify_answer)
     from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
-                             expand_query, merge_llm_analysis, rule_query_analysis,
-                             should_use_llm)
+                             expand_query, merge_llm_analysis, rule_query_analysis)
     from retrieval import MIN_SIMILARITY, search
     import trend_service
     from schemas import AskResponse, SourceItem
@@ -40,14 +38,16 @@ class RAGError(RuntimeError):
 
 def _query_analysis(question: str) -> tuple[QueryAnalysis, bool]:
     rule = rule_query_analysis(question)
-    if not should_use_llm(rule):
-        return rule, False
     try:
         from .openai_client import analyze_question as llm_analyze_question
     except ImportError:
         from openai_client import analyze_question as llm_analyze_question
     try:
-        return merge_llm_analysis(rule, llm_analyze_question(question)), True
+        analysis = merge_llm_analysis(rule, llm_analyze_question(question))
+        if analysis.confidence < config.QUERY_UNDERSTANDING_MIN_CONFIDENCE:
+            logger.warning('Query understanding confidence is low; using rule-based analysis.')
+            return rule, False
+        return analysis, True
     except OpenAIServiceError:
         logger.warning('Query understanding failed; using rule-based analysis.')
         return rule, False
@@ -56,7 +56,11 @@ def _query_analysis(question: str) -> tuple[QueryAnalysis, bool]:
 def _search(question: str, top_k: int, analysis: QueryAnalysis | None = None) -> list[dict]:
     try:
         analysis = analysis or _query_analysis(question)[0]
-        embedding = embed_question(' | '.join(expand_query(question, analysis)))
+        queries = analysis.search_queries or expand_query(question, analysis)
+        embedding_query = ' '.join(dict.fromkeys(
+            [analysis.entity or '', analysis.normalized_question, *analysis.keywords, *queries]
+        ))
+        embedding = embed_question(embedding_query[:1000])
         return search(embedding, question, top_k, MIN_SIMILARITY, analysis=analysis)
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
@@ -269,10 +273,11 @@ def answer_question(question: str, top_k: int) -> AskResponse:
     answer = remap_citations(checked.answer, checked.citation_ids)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
         logger.warning('[QUERY] original=%s rule_intent=%s llm_used=%s entity=%s '
-                       'intent=%s time_range=%s confidence=%.2f normalized=%s keywords=%s',
+                       'intent=%s time_range=%s confidence=%.2f normalized=%s keywords=%s search_queries=%s',
                        question, rule_query_analysis(question).intent, llm_used,
                        analysis.entity, analysis.intent, analysis.time_range,
-                       analysis.confidence, analysis.normalized_question, list(analysis.keywords))
+                       analysis.confidence, analysis.normalized_question, list(analysis.keywords),
+                       list(analysis.search_queries))
         expanded_queries = expand_query(question, analysis)
         if analysis.intent == 'definition':
             logger.warning('[definition] question=%s entity=%s expanded_queries=%s '
