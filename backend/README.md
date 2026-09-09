@@ -50,7 +50,7 @@ Invoke-RestMethod http://127.0.0.1:8000/ask -Method Post -ContentType 'applicati
 - `/health`: SELECT 1 성공 시 HTTP 200과 status/api/database = ok. DB 실패 시 HTTP 503과 status=error, api=ok, database=error.
 - `/stats`: total_articles, total_embeddings, last_collected_at, source_count 반환. 빈 테이블에서는 0, 0, null, 0입니다. DB/테이블 조회 실패는 HTTP 503입니다.
 - `/ask`: 질문을 임베딩한 뒤 기존 article_embeddings를 cosine 검색하고, 검색 기사만 LLM context로 전달합니다. 결과 URL은 articles.url에서 반환합니다.
-- 검색 결과가 없으면 `현재 수집된 자료에서 관련 정보를 찾지 못했습니다.`를 반환하고 LLM을 호출하지 않습니다.
+- 검색 결과가 없으면 `현재 수집된 자료만으로는 확인하기 어렵습니다.`를 반환하고 LLM을 호출하지 않습니다.
 - `OPENAI_CHAT_MODEL`은 기본값 `gpt-4o-mini`, `RAG_MIN_SIMILARITY`는 기본값 `0.3`입니다.
 - question 누락/빈 문자열/공백만 입력, top_k 1~10 범위 밖 입력은 HTTP 422입니다. top_k 생략 시 5입니다.
 
@@ -75,3 +75,33 @@ Invoke-RestMethod http://127.0.0.1:8000/ask -Method Post -ContentType 'applicati
 
 회귀 테스트: 프로젝트 루트에서 `backend/.venv/Scripts/python.exe -m unittest backend.test_retrieval`.
 실제 후보의 1·2단계 비교는 [SEARCH_QUALITY_REPORT.md](SEARCH_QUALITY_REPORT.md)를 참고하세요.
+
+## 답변 신뢰성 검증
+
+검색/임베딩/재정렬과 API 요청·응답 schema는 유지합니다. 검색 결과가 있으면 다음 순서로 처리합니다.
+
+1. 기존 OpenAI chat 모델로 근거 제한 프롬프트를 사용해 초안을 생성합니다.
+2. `answer_validator.py`가 문장별 citation 범위, 숫자·단위·날짜·따옴표 안 명칭 및 구체적 단어를 확인합니다.
+3. 같은 `OPENAI_CHAT_MODEL`로 최종 검증을 1회 호출합니다. 주체·행위·시점·질문 의도가 실제 근거와 맞는지 확인하고, 기사 원문 문장을 최대 3개 선택하도록 요청합니다.
+4. 검증 출력에도 규칙 검사를 다시 적용합니다. 최종 사실 문장은 인용한 기사 제목 전체 또는 본문의 완전한 문장과 일치해야 합니다. 의역의 모든 구체적 토큰이 원문 한 문장에 함께 있으면 그 원문으로 교체하고, 여러 문장에 흩어져 있거나 근거가 없으면 제거합니다. 공백·따옴표 모양·끝 문장부호 차이만 허용하며 주어 변경이나 문장 조합은 허용하지 않습니다. 최종 답변은 최대 3문장입니다.
+5. 상세 설명이 모두 탈락했지만 모델이 인용한 기사 제목에 질문 entity·intent가 직접 나타나면 그 제목만 보수적으로 사용합니다. 예를 들어 근거 없는 개봉일은 제거하고 원문 제목의 개봉 소식만 반환할 수 있습니다. 모델이 명시적으로 확인 불가라고 판정하면 이 fallback도 하지 않습니다.
+6. 통과한 문장에 사용된 기사만 `sources`에 남기고 답변 citation을 `[1]`부터 다시 매깁니다. qa_logs에도 최종 답변·사용 출처를 기록합니다. 기존 score/top_score는 cosine 유사도입니다.
+
+검증 근거는 모델에게 실제로 보낸 기사 제목과 요약 우선/본문 대체 최대 4000자입니다.
+발행일·URL·전달하지 않은 본문은 날짜나 활동 이력을 입증하는 근거로 사용하지 않습니다.
+각 기사 context에는 번호·제목·출처·발행일·본문·URL과 시작/끝 구분을 유지합니다.
+
+잘못된/누락된 인용, 근거 없는 구체적 토큰, 원문과 다른 문장은 제거합니다.
+확인 불가라는 전반적 결론이 사실 문장과 함께 나오면 보수적으로 근거 부족 응답으로 통일합니다.
+검증 서비스 오류나 통과 문장 부재 시 미검증 초안을 반환하지 않고 `현재 수집된 자료만으로는 확인하기 어렵습니다.`와 빈 sources를 반환합니다.
+이 경우 qa_logs의 is_answered=false, top_score=null입니다. 질문 임베딩/초안 생성 오류의 기존 503 처리는 유지합니다.
+
+검색 결과가 있으면 생성 1회 + 검증 1회로 지연과 비용이 늘어납니다. 검증 재시도 루프나 별도 모델은 추가하지 않았습니다.
+`RAG_DEBUG=true`일 때 삭제 문장 수와 사용 원본 citation 번호만 추가 기록하며 초안 전문은 로그에 출력하지 않습니다.
+
+이 정책은 자유로운 요약보다 정확성을 우선하므로 올바른 의역도 제거할 수 있습니다.
+원문 인용 자체가 질문에 적절한지, 원문 정보가 사실인지까지 수학적으로 보장하지는 않으며 의미 적합성은 모델 검증에 의존합니다.
+관계나 시점 해석이 어려우면 답변을 줄이거나 보류합니다.
+
+회귀 테스트: `backend/.venv/Scripts/python.exe -m unittest backend.test_retrieval backend.test_answer_validator`.
+실제 다섯 질문의 검색 기사·초안·모델 검증·최종 답변·삭제 문장·인용 비교는 기존 [비교 보고서](SEARCH_QUALITY_REPORT.md)의 답변 신뢰성 절에 기록합니다.

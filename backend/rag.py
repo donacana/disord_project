@@ -7,13 +7,15 @@ from datetime import datetime
 if __package__:
     from . import db
     from .openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
-    from .answer_validator import INSUFFICIENT_ANSWER, remap_citations, validate_answer
+    from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
+    from .query_utils import ARTICLE_INTENT_TERMS, analyze_query
     from .retrieval import MIN_SIMILARITY, search
     from .schemas import AskResponse, SourceItem
 else:
     import db
     from openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
-    from answer_validator import INSUFFICIENT_ANSWER, remap_citations, validate_answer
+    from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
+    from query_utils import ARTICLE_INTENT_TERMS, analyze_query
     from retrieval import MIN_SIMILARITY, search
     from schemas import AskResponse, SourceItem
 
@@ -69,6 +71,36 @@ def _source(article: dict) -> SourceItem:
     )
 
 
+def _title_fallback(question: str, reviewed: str, results: list[dict], checked):
+    """Keep a directly relevant headline when an over-detailed review is pruned.
+
+    Never override the verifier's explicit insufficiency verdict, and never
+    infer performances/releases from a generic collaboration headline.
+    """
+    if checked.citation_ids or reviewed.strip() == INSUFFICIENT_ANSWER or 'global_insufficiency' in checked.reasons:
+        return checked
+    hints = analyze_query(question)
+    terms = ARTICLE_INTENT_TERMS.get(hints.intent, ())
+    if not terms:
+        return checked
+    lines = []
+    for number in sorted(set(map(int, CITATION.findall(reviewed)))):
+        if not 1 <= number <= len(results):
+            continue
+        title = results[number - 1]['title']
+        folded = title.casefold()
+        if (not any(term in folded for term in terms)
+                or any(entity not in folded for entity in hints.entities)):
+            continue
+        # A specific release/movie/drama intent can be sufficient without an
+        # entity. Otherwise require a question keyword in the title as well.
+        if not hints.entities and not hints.strict_category and not any(word in folded for word in hints.keywords):
+            continue
+        lines.append(f'{title}[{number}]')
+    fallback = validate_answer('\n'.join(lines), _evidence(results), require_extract=True)
+    return fallback if fallback.citation_ids else checked
+
+
 def _log_result(question: str, answer: str, results: list[dict], top_score: float | None,
                 is_answered: bool, latency_ms: int) -> None:
     sources = [
@@ -112,13 +144,14 @@ def answer_question(question: str, top_k: int) -> AskResponse:
         # Never return an unverified draft on verifier failure.
         reviewed = INSUFFICIENT_ANSWER
         logger.warning('Answer verification failed; returning insufficient evidence response.')
-    checked = validate_answer(reviewed, evidence)
+    checked = validate_answer(reviewed, evidence, require_extract=True)
+    checked = _title_fallback(question, reviewed, results, checked)
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
-        logger.warning('answer_validation draft_removed=%d final_removed=%d citations=%s',
+        logger.warning('answer_validation draft_removed=%d final_removed=%d replaced=%d citations=%s',
                        len(draft_check.removed_sentences), len(checked.removed_sentences),
-                       checked.citation_ids)
+                       len(checked.replaced_sentences), checked.citation_ids)
     _log_result(
         question,
         answer,

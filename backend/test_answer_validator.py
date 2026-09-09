@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from backend import db, main, openai_client, rag
 from backend.answer_validator import INSUFFICIENT_ANSWER, remap_citations, sentences, validate_answer
 
-EVIDENCE = '테스트그룹 게임 컬래버 진행. 게임 브랜드와 협업.'
+EVIDENCE = '테스트그룹은 게임 컬래버를 진행했습니다. 테스트그룹 게임 컬래버 진행. 게임 브랜드와 협업.'
 SUPPORTED = '테스트그룹은 게임 컬래버를 진행했습니다.[1]'
 
 
@@ -70,6 +70,22 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(validate_answer(SUPPORTED.replace('[1]', '[2]'), evidence).citation_ids, ())
         self.assertEqual(validate_answer(SUPPORTED.replace('[1]', '[1][2]'), evidence).citation_ids, ())
         self.assertEqual(validate_answer(SUPPORTED.replace('[1]', '[1][2]'), [EVIDENCE, EVIDENCE]).citation_ids, (1, 2))
+
+    def test_extractive_mode_prevents_role_reversal_and_fragments(self):
+        evidence = ['소속사는 가수를 보호했다. 가수는 소속사와 활동했다.']
+        changed = '가수는 소속사를 보호했다.[1]'
+        corrected = validate_answer(changed, evidence, require_extract=True)
+        self.assertEqual(corrected.answer, '소속사는 가수를 보호했다.[1]')
+        self.assertTrue(corrected.replaced_sentences)
+        self.assertEqual(validate_answer('소속사는 가수를 보호했다.[1]', evidence, require_extract=True).citation_ids, (1,))
+        self.assertEqual(validate_answer('가수를 보호했다.[1]', evidence, require_extract=True).answer,
+                         '소속사는 가수를 보호했다.[1]')
+        self.assertEqual(validate_answer(SUPPORTED, [EVIDENCE], require_extract=True).citation_ids, (1,))
+
+    def test_cannot_combine_facts_from_different_source_sentences(self):
+        evidence = ['테스트그룹 2026년 공연. 다른그룹 1월 데뷔.']
+        result = validate_answer('테스트그룹 2026년 1월 데뷔.[1]', evidence, require_extract=True)
+        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
 
     def test_contradictory_global_conclusion(self):
         result = validate_answer(SUPPORTED + '\n현재 수집된 자료에서 확인하기 어렵습니다.', [EVIDENCE])
@@ -163,6 +179,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(client.chat.completions.create.call_count, 2)
         self.assertEqual([call.kwargs['model'] for call in client.chat.completions.create.call_args_list],
                          ['configured-model', 'configured-model'])
+
+    def test_generation_failure_keeps_503_contract(self):
+        with patch.object(rag, '_search', return_value=[article(1)]), \
+                patch.object(rag, 'generate_answer', side_effect=openai_client.OpenAIServiceError('failed')), \
+                patch.object(rag, 'verify_answer') as verify:
+            response = TestClient(main.app).post('/ask', json={'question': '활동'})
+        self.assertEqual(response.status_code, 503)
+        verify.assert_not_called()
+
+    def test_title_fallback_preserves_only_explicit_question_evidence(self):
+        row = article(1, '영화 관련 인터뷰')
+        row['title'] = "영화 '테스트작품', 11월 개봉"
+        reviewed = "영화 '테스트작품'은 11월 20일 개봉합니다.[1]"
+        checked = validate_answer(reviewed, rag._evidence([row]), require_extract=True)
+        self.assertEqual(checked.citation_ids, ())
+        result = rag._title_fallback('최근 영화 개봉작 알려줘', reviewed, [row], checked)
+        self.assertEqual(result.answer, row['title'] + '[1]')
+        self.assertNotIn('20일', result.answer)
+        insufficient = validate_answer(INSUFFICIENT_ANSWER, rag._evidence([row]), require_extract=True)
+        self.assertEqual(rag._title_fallback('최근 영화 개봉작 알려줘', INSUFFICIENT_ANSWER,
+                                            [row], insufficient).answer, INSUFFICIENT_ANSWER)
+        row['title'] = '테스트그룹 게임 컬래버'
+        reviewed = '테스트그룹은 공연이 활발합니다.[1]'
+        checked = validate_answer(reviewed, rag._evidence([row]), require_extract=True)
+        self.assertEqual(rag._title_fallback('테스트그룹 공연', reviewed, [row], checked).answer,
+                         INSUFFICIENT_ANSWER)
 
 
 if __name__ == '__main__':

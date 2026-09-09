@@ -181,7 +181,7 @@ class RetrievalTests(unittest.TestCase):
         with patch.object(rag, 'embed_question', return_value=[0.1]), \
                 patch.object(db, 'fetch_all', return_value=rows), \
                 patch.object(rag, 'generate_answer', return_value='아이브 소식 [1]') as generate, \
-                patch.object(rag, 'verify_answer', return_value='아이브 소식 [1]'), \
+                patch.object(rag, 'verify_answer', return_value='아이브 월드투어 [1]'), \
                 patch.object(db, 'execute') as log:
             response = client.post('/ask', json={'question': '아이브', 'top_k': 1})
             self.assertEqual(response.status_code, 200)

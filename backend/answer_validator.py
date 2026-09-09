@@ -17,7 +17,9 @@ PARTICLES = ('으로부터', '에서는', '에게는', '으로는', '에서', '�
              '부터', '에는', '이랑', '처럼', '하고', '이며', '이고', '은', '는', '이',
              '가', '을', '를', '의', '에', '와', '과', '도')
 PREDICATE_ENDINGS = ('하였습니다', '되었습니다', '했습니다', '됐습니다', '합니다',
-                     '됩니다', '했습니다', '이라고', '입니다', '습니다', '했다', '한다')
+                     '됩니다', '되었다', '됐다고', '이라고', '입니다', '습니다', '했다', '한다')
+MAX_VERIFIED_SENTENCES = 3
+MAX_EVIDENCE_SENTENCE_CHARS = 600
 # Grammatical/reporting expressions, not artist/work/brand names.
 FUNCTION_WORDS = {
     '최근', '현재', '요즘', '수집된', '검색', '자료', '자료에서', '기사', '기사에서',
@@ -44,6 +46,7 @@ class ValidationResult:
     citation_ids: tuple[int, ...]
     removed_sentences: tuple[str, ...]
     reasons: tuple[str, ...]
+    replaced_sentences: tuple[tuple[str, str], ...] = ()
 
 
 def _normalize(text: str) -> str:
@@ -110,15 +113,39 @@ def _supported(claim: str, evidence: str) -> bool:
     return bool(tokens) and all(token in evidence for token in tokens)
 
 
-def validate_answer(answer: str, evidence: list[str]) -> ValidationResult:
+def _is_extract(claim: str, evidence: str) -> bool:
+    # Whitespace/quote typography and terminal punctuation may differ, but the
+    # original subject, action, numbers and word order must be preserved.
+    def canonical(text):
+        text = _normalize(text).translate(str.maketrans({'‘': "'", '’': "'", '“': '"', '”': '"'}))
+        return re.sub(r'\s+', '', text).strip(' .!?。！？')
+    claim = canonical(claim)
+    return bool(claim) and any(claim == canonical(unit) for unit in sentences(evidence))
+
+
+def _grounded_extract(claim: str, cited_evidence: list[str]) -> str | None:
+    # If a verified paraphrase has all its specific facts in ONE source
+    # sentence, return that original sentence rather than synthesizing prose.
+    # A bag of matching words spread across the article is not sufficient.
+    candidates = []
+    for unit in sentences(cited_evidence[0]):
+        if len(unit) > MAX_EVIDENCE_SENTENCE_CHARS or '[' in unit or ']' in unit:
+            continue
+        if _supported(claim, unit) and all(_is_extract(unit, source) for source in cited_evidence[1:]):
+            candidates.append(unit)
+    return min(candidates, key=len) if candidates else None
+
+
+def validate_answer(answer: str, evidence: list[str], *, require_extract: bool = False) -> ValidationResult:
     answer = unicodedata.normalize('NFKC', answer).strip()
     units = sentences(answer)
     # A standalone global insufficiency conclusion conflicts with a factual
     # answer. Fail closed rather than retaining the confident half arbitrarily.
     if any(CITATION.sub('', unit).strip() in GLOBAL_ABSTENT for unit in units):
         removed = tuple(unit for unit in units if unit not in GLOBAL_ABSTENT)
-        return ValidationResult(INSUFFICIENT_ANSWER, (), removed, ('global_insufficiency',))
-    kept, removed, reasons = [], [], []
+        return ValidationResult(INSUFFICIENT_ANSWER, (), removed,
+                                ('global_insufficiency',) * len(removed))
+    kept, removed, reasons, replaced = [], [], [], []
     used = set()
     for unit in units:
         citations = CITATION.findall(unit)
@@ -136,14 +163,26 @@ def validate_answer(answer: str, evidence: list[str]) -> ValidationResult:
             # rejects multi-claim sentences spread across unrelated sources.
             if not all(_supported(claim, evidence[number - 1]) for number in ids):
                 reason = 'unsupported_specific_tokens'
+            elif require_extract and not all(_is_extract(claim, evidence[number - 1]) for number in ids):
+                original = _grounded_extract(claim, [evidence[number - 1] for number in ids])
+                if original is None:
+                    reason = 'not_an_evidence_sentence'
+                else:
+                    grounded = original + ''.join(f'[{number}]' for number in ids)
+                    replaced.append((unit, grounded))
+                    unit = grounded
         if reason:
             removed.append(unit)
             reasons.append(reason)
         else:
+            if require_extract and (unit in kept or len(kept) >= MAX_VERIFIED_SENTENCES):
+                removed.append(unit)
+                reasons.append('duplicate_or_sentence_limit')
+                continue
             kept.append(unit)
             used.update(ids)
     return ValidationResult('\n'.join(kept) if kept else INSUFFICIENT_ANSWER,
-                            tuple(sorted(used)), tuple(removed), tuple(reasons))
+                            tuple(sorted(used)), tuple(removed), tuple(reasons), tuple(replaced))
 
 
 def remap_citations(answer: str, citation_ids: tuple[int, ...]) -> str:
