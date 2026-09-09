@@ -17,7 +17,8 @@ PARTICLES = ('으로부터', '에서는', '에게는', '으로는', '에서', '�
              '부터', '에는', '이랑', '처럼', '하고', '이며', '이고', '은', '는', '이',
              '가', '을', '를', '의', '에', '와', '과', '도')
 PREDICATE_ENDINGS = ('하였습니다', '되었습니다', '했습니다', '됐습니다', '합니다',
-                     '됩니다', '되었다', '됐다고', '이라고', '입니다', '습니다', '했다', '한다')
+                     '됩니다', '되었다', '됐다고', '이라고', '입니다', '습니다',
+                     '했다', '한다', '이며', '이고', '발매했다', '컴백했다')
 MAX_VERIFIED_SENTENCES = 3
 MAX_EVIDENCE_SENTENCE_CHARS = 600
 # Grammatical/reporting expressions, not artist/work/brand names.
@@ -139,15 +140,15 @@ def _grounded_extract(claim: str, cited_evidence: list[str]) -> str | None:
 def validate_answer(answer: str, evidence: list[str], *, require_extract: bool = False) -> ValidationResult:
     answer = unicodedata.normalize('NFKC', answer).strip()
     units = sentences(answer)
-    # A standalone global insufficiency conclusion conflicts with a factual
-    # answer. Fail closed rather than retaining the confident half arbitrarily.
-    if any(CITATION.sub('', unit).strip() in GLOBAL_ABSTENT for unit in units):
-        removed = tuple(unit for unit in units if unit not in GLOBAL_ABSTENT)
-        return ValidationResult(INSUFFICIENT_ANSWER, (), removed,
-                                ('global_insufficiency',) * len(removed))
     kept, removed, reasons, replaced = [], [], [], []
     used = set()
     for unit in units:
+        if CITATION.sub('', unit).strip() in GLOBAL_ABSTENT:
+            if len(units) == 1:
+                return ValidationResult(INSUFFICIENT_ANSWER, (), (), ('global_insufficiency',))
+            removed.append(unit)
+            reasons.append('global_insufficiency')
+            continue
         citations = CITATION.findall(unit)
         brackets = BRACKET.findall(unit)
         residue = CITATION.sub('', unit)

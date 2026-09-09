@@ -8,14 +8,14 @@ if __package__:
     from . import db
     from .openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
     from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from .query_utils import ARTICLE_INTENT_TERMS, analyze_query
+    from .query_utils import ARTICLE_INTENT_TERMS, analyze_query, expand_query
     from .retrieval import MIN_SIMILARITY, search
     from .schemas import AskResponse, SourceItem
 else:
     import db
     from openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
     from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from query_utils import ARTICLE_INTENT_TERMS, analyze_query
+    from query_utils import ARTICLE_INTENT_TERMS, analyze_query, expand_query
     from retrieval import MIN_SIMILARITY, search
     from schemas import AskResponse, SourceItem
 
@@ -30,7 +30,8 @@ class RAGError(RuntimeError):
 
 def _search(question: str, top_k: int) -> list[dict]:
     try:
-        embedding = embed_question(question)
+        hints = analyze_query(question)
+        embedding = embed_question(' | '.join(expand_query(question, hints)))
         return search(embedding, question, top_k, MIN_SIMILARITY)
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
@@ -77,20 +78,25 @@ def _title_fallback(question: str, reviewed: str, results: list[dict], checked):
     Never override the verifier's explicit insufficiency verdict, and never
     infer performances/releases from a generic collaboration headline.
     """
-    if checked.citation_ids or reviewed.strip() == INSUFFICIENT_ANSWER or 'global_insufficiency' in checked.reasons:
-        return checked
     hints = analyze_query(question)
+    if checked.citation_ids or (reviewed.strip() == INSUFFICIENT_ANSWER
+                                and hints.intent != 'definition'):
+        return checked
     terms = ARTICLE_INTENT_TERMS.get(hints.intent, ())
-    if not terms:
+    if not terms and hints.intent != 'definition':
         return checked
     lines = []
-    for number in sorted(set(map(int, CITATION.findall(reviewed)))):
+    cited_numbers = sorted(set(map(int, CITATION.findall(reviewed))))
+    numbers = cited_numbers or list(range(1, len(results) + 1))
+    for number in numbers:
         if not 1 <= number <= len(results):
             continue
         title = results[number - 1]['title']
         folded = title.casefold()
-        if (not any(term in folded for term in terms)
-                or any(entity not in folded for entity in hints.entities)):
+        direct_entity = bool(hints.entities) and all(entity.casefold() in folded for entity in hints.entities)
+        title_has_intent = any(term in folded for term in terms)
+        if not ((hints.intent == 'definition' and direct_entity)
+                or (title_has_intent and (direct_entity or not hints.entities))):
             continue
         # A specific release/movie/drama intent can be sufficient without an
         # entity. Otherwise require a question keyword in the title as well.
@@ -144,11 +150,23 @@ def answer_question(question: str, top_k: int) -> AskResponse:
         # Never return an unverified draft on verifier failure.
         reviewed = INSUFFICIENT_ANSWER
         logger.warning('Answer verification failed; returning insufficient evidence response.')
-    checked = validate_answer(reviewed, evidence, require_extract=True)
+    checked = validate_answer(reviewed, evidence)
     checked = _title_fallback(question, reviewed, results, checked)
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+        hints = analyze_query(question)
+        expanded_queries = expand_query(question, hints)
+        if hints.intent == 'definition':
+            logger.warning('[definition] question=%s entity=%s expanded_queries=%s '
+                           'candidate_count=%d final_docs=%d',
+                           question, ','.join(hints.entities), list(expanded_queries),
+                           len(results), len(used_results))
+        logger.warning('[RAG] question=%s intent=%s entity=%s after_filter=%d '
+                       'generated_answer=%s validated_sentences=%d removed_sentences=%d',
+                       question, hints.intent, ','.join(hints.entities), len(results),
+                       bool(draft.strip()), len(checked.citation_ids),
+                       len(checked.removed_sentences))
         logger.warning('answer_validation draft_removed=%d final_removed=%d replaced=%d citations=%s',
                        len(draft_check.removed_sentences), len(checked.removed_sentences),
                        len(checked.replaced_sentences), checked.citation_ids)

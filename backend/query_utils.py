@@ -14,6 +14,8 @@ STOPWORDS = {
     '관련', '어떻게', '했어', '찍었어', '주요', '이슈', '대한', '대해',
     '좀', '어떤', '있어', '있나요', '해줘', '뉴스', '있었어', '있었나요',
     '알려', '주세요', '이번', '주', '달', '추천해줘', '궁금해',
+    '누구', '누구야', '누군데', '누구인데', '누구임', '누구냐', '누구인지',
+    '무엇', '무엇이야', '뭔데', '소개해줘',
 }
 # Longer particles first; retain at least two characters in proper-name candidates.
 PARTICLES = ('에서는', '에게는', '으로는', '에서', '에게', '한테', '에대한',
@@ -23,6 +25,9 @@ TOPIC_TERMS = {'영화', '드라마', '음악', '공연', '광고', '앨범', '�
 
 # Specific requests take precedence over the generic activity intent.
 INTENT_TERMS = {
+    'definition': ('누구야', '누군데', '누구인데', '누구임', '누구냐', '누구인지',
+                   '어떤 그룹이야', '무슨 그룹이야', '어떤 사람이야', '뭐야', '뭔데',
+                   '소개해줘', '무엇', '멤버', '소속'),
     'controversy': ('논란', '사건', '소송', '고소', '법원', '징역', '모욕', '재판', '혐의',
                     '판결', '의혹', '갑질', '루머'),
     'advertisement': ('광고', '브랜드', '화보', '앰버서더', '캠페인'),
@@ -35,6 +40,7 @@ INTENT_TERMS = {
 }
 ARTICLE_INTENT_TERMS = {
     **INTENT_TERMS,
+    'definition': ('그룹', '멤버', '소속', '데뷔', '활동', '아이돌', '가수'),
     'activity': ('활동', '공연', '컴백', '출연', '투어', '앨범', '방송', '팬미팅',
                  '광고', '브랜드', '화보', '행사', '촬영', '무대', '개봉', '신곡'),
     'movie_release': ('개봉', '개봉작', '상영'),
@@ -102,5 +108,47 @@ def analyze_query(question: str) -> QueryHints:
         elif '예능' in compact:
             categories = ('show',)
     entities = tuple(word for word in keywords if word not in GENERAL_TERMS)
+    if intent == 'definition':
+        definition_entity = extract_definition_entity(question)
+        if definition_entity:
+            entities = (definition_entity,)
     days = 7 if '이번주' in compact else DEFAULT_RECENT_DAYS if wants_recent(question) else None
     return QueryHints(tuple(keywords), entities, intent, categories, strict, days)
+
+
+def extract_definition_entity(question: str) -> str | None:
+    """Extract the subject before a definition expression and remove particles."""
+    text = re.sub(r'\s+', ' ', question).strip(' ?.!。！？')
+    expression = re.compile(
+        r'(?:은|는|이|가|을|를)?\s*'
+        r'(?:누구야|누군데|누구인데|누구임|누구냐|뭐야|뭔데|무엇이야|'
+        r'어떤 그룹이야|무슨 그룹이야|어떤 사람이야|누구인지 알려줘|소개해줘)'
+        r'\s*$',
+        re.IGNORECASE,
+    )
+    match = expression.search(text)
+    if not match:
+        return None
+    entity = text[:match.start()].strip()
+    entity = re.sub(r'(은|는|이|가|을|를)\s*$', '', entity).strip()
+    return entity or None
+
+
+
+def expand_query(question: str, hints: QueryHints | None = None) -> tuple[str, ...]:
+    """Return deterministic search variants without another model request."""
+    hints = hints or analyze_query(question)
+    base = list(hints.entities) or list(hints.keywords)
+    if not base:
+        return (question,)
+    subject = ' '.join(base)
+    variants = [subject]
+    if hints.intent == 'definition':
+        variants.extend((f'{subject} 그룹', f'{subject} 멤버', f'{subject} 활동'))
+    elif hints.intent == 'activity':
+        variants.extend((f'{subject} 활동', f'{subject} 출연', f'{subject} 컴백'))
+    elif hints.intent == 'controversy':
+        variants.extend((f'{subject} 논란', f'{subject} 사건', f'{subject} 법적 대응'))
+    else:
+        variants.append(question)
+    return tuple(dict.fromkeys(variants))

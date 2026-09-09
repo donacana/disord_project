@@ -85,16 +85,19 @@ def score_candidate(row: dict, hints: QueryHints, now: datetime) -> dict | None:
     published = _datetime(row.get('published_at'))
     in_period = bool(hints.recent_days and published and
                      max(0, (now - published).days) <= hints.recent_days)
+    title_entity_bonus = (config.ENTITY_TITLE_BONUS
+                          if entity_title == 1.0 and hints.entities else 0.0)
     final = (max(0.0, min(1.0, similarity)) * config.VECTOR_WEIGHT
              + keyword * config.KEYWORD_WEIGHT + title_match * config.TITLE_WEIGHT
              + recency * config.RECENCY_WEIGHT + entity * config.ENTITY_WEIGHT
-             + intent * config.INTENT_WEIGHT + category * config.CATEGORY_WEIGHT)
-    if hints.strict_category and category_name and not category:
+             + intent * config.INTENT_WEIGHT + category * config.CATEGORY_WEIGHT
+             + title_entity_bonus)
+    if hints.strict_category and hints.intent != 'definition' and category_name and not category:
         # Strong title evidence softens a potentially incorrect category label.
         final -= config.CATEGORY_MISMATCH_PENALTY * (0.25 if title_intent else 1.0)
     if hints.entities and not entity:
         final -= config.ENTITY_MISMATCH_PENALTY
-    if conflict:
+    if conflict and hints.intent != 'definition':
         final -= config.ACTIVITY_CONFLICT_PENALTY
     return dict(row, distance=distance, similarity=similarity, keyword_score=keyword,
                 title_score=title_match, entity_score=entity, entity_title_score=entity_title,
@@ -105,13 +108,14 @@ def score_candidate(row: dict, hints: QueryHints, now: datetime) -> dict | None:
 
 
 def _eligible(row: dict, hints: QueryHints, min_similarity: float) -> bool:
+    effective_min_similarity = max(0.0, min_similarity - config.SIMILARITY_MARGIN)
     # A bounded rescue for exact title/entity evidence; never bypass a configured
     # threshold by more than the margin, and never rescue nonpositive vectors.
     title_rescue = (bool(hints.entities) and row['entity_title_score'] == 1.0
                     and row['similarity'] >= max(config.TITLE_RESCUE_FLOOR,
-                                                min_similarity - config.TITLE_RESCUE_MARGIN)
+                                                effective_min_similarity - config.TITLE_RESCUE_MARGIN)
                     and row['final_score'] >= config.ENTITY_SCORE_FLOOR)
-    if row['similarity'] < min_similarity and not title_rescue:
+    if row['similarity'] < effective_min_similarity and not title_rescue:
         return False
     if row['final_score'] < config.FINAL_SCORE_FLOOR or row['intent_conflict']:
         return False
@@ -120,7 +124,7 @@ def _eligible(row: dict, hints: QueryHints, min_similarity: float) -> bool:
             return row['final_score'] >= config.ENTITY_SCORE_FLOOR
         # Missing entity is not an unconditional veto, but indirect results need
         # strong vector, title intent AND category evidence, and a separate cap.
-        return (row['similarity'] >= max(min_similarity, config.INDIRECT_MIN_SIMILARITY)
+        return (row['similarity'] >= max(effective_min_similarity, config.INDIRECT_MIN_SIMILARITY)
                 and row['intent_score'] == 1.0 and row['category_score'] == 1.0
                 and row['final_score'] >= config.INDIRECT_SCORE_FLOOR)
     if hints.intent or hints.categories:
@@ -226,6 +230,11 @@ def rank_candidates(rows: list[dict], question: str, top_k: int,
 def search(embedding: list[float], question: str, top_k: int,
            min_similarity: float = MIN_SIMILARITY) -> list[dict]:
     vector = '[' + ','.join(str(value) for value in embedding) + ']'
-    candidate_count = min(config.MAX_CANDIDATES, top_k * config.CANDIDATE_MULTIPLIER)
+    candidate_count = min(config.MAX_CANDIDATES,
+                          max(config.CANDIDATE_TOP_K, top_k * config.CANDIDATE_MULTIPLIER))
     rows = db.fetch_all(SEARCH_QUERY, (vector, vector, candidate_count))
-    return rank_candidates(rows, question, top_k, min_similarity)
+    ranked = rank_candidates(rows, question, top_k, min_similarity)
+    if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+        logger.warning('[RAG] question=%s vector_candidates=%d after_rerank=%d final_docs=%d',
+                       question, len(rows), len(ranked), len(ranked))
+    return ranked

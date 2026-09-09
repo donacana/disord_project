@@ -49,6 +49,12 @@ class ValidatorTests(unittest.TestCase):
             self.assertEqual(result.answer, SUPPORTED, sentence)
             self.assertEqual(result.removed_sentences, (sentence,))
 
+    def test_grounded_paraphrase_keeps_supported_sentence(self):
+        result = validate_answer('테스트그룹은 게임 협업을 진행했습니다.[1]', [EVIDENCE])
+        self.assertEqual(result.citation_ids, (1,))
+        unsupported = validate_answer('테스트그룹은 큰 인기를 끌고 있습니다.[1]', [EVIDENCE])
+        self.assertEqual(unsupported.answer, INSUFFICIENT_ANSWER)
+
     def test_numeric_boundaries_and_units(self):
         evidence = '테스트그룹 2026년 11월 공연. 관객 12명. 가격 1.5만원.'
         for claim in ['테스트그룹 2026년 1월 공연.[1]', '관객 2명.[1]', '가격 1.6만원.[1]']:
@@ -89,8 +95,9 @@ class ValidatorTests(unittest.TestCase):
 
     def test_contradictory_global_conclusion(self):
         result = validate_answer(SUPPORTED + '\n현재 수집된 자료에서 확인하기 어렵습니다.', [EVIDENCE])
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.citation_ids, ())
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(result.citation_ids, (1,))
+        self.assertEqual(result.removed_sentences, ('현재 수집된 자료에서 확인하기 어렵습니다.',))
         self.assertEqual(validate_answer('', [EVIDENCE]).answer, INSUFFICIENT_ANSWER)
 
     def test_only_visible_context_can_support_claims(self):

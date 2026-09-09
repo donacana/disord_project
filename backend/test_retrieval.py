@@ -5,7 +5,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from backend import config, db, main, rag, retrieval
-from backend.query_utils import analyze_query, extract_keywords
+from backend.query_utils import analyze_query, expand_query, extract_keywords
 
 NOW = datetime(2026, 9, 9, tzinfo=timezone.utc)
 
@@ -40,7 +40,7 @@ class RetrievalTests(unittest.TestCase):
         rows = [article(1, '아이브', .29), article(2, '무관 기사', .6)]
         with patch.object(db, 'fetch_all', return_value=rows) as fetch:
             result = retrieval.search([0.1], '아이브', 5, .3)
-        self.assertEqual(fetch.call_args.args[1][-1], 20)
+        self.assertEqual(fetch.call_args.args[1][-1], 40)
         self.assertEqual([r['article_id'] for r in result], [1])
         self.assertEqual(retrieval.rank_candidates(rows, '아이브', 5, .9), [])
 
@@ -79,6 +79,24 @@ class RetrievalTests(unittest.TestCase):
             hints = analyze_query(question)
             self.assertEqual((hints.entities, hints.intent, hints.categories, hints.recent_days),
                              (entities, intent, categories, days))
+
+    def test_definition_activity_and_query_expansion(self):
+        definition = retrieval.rank_candidates(
+            [article(1, '알파드라이브원, 새 앨범으로 컴백', .28)],
+            '알파드라이브원은 누구야?', 5, now=NOW)
+        self.assertEqual([row['article_id'] for row in definition], [1])
+        self.assertEqual(analyze_query('알파드라이브원은 누구야?').intent, 'definition')
+        self.assertIn('알파드라이브원 그룹', expand_query('알파드라이브원은 누구야?'))
+
+        activity = retrieval.rank_candidates(
+            [article(1, '장원영 광고 화보 공개', .45)],
+            '장원영 최근 활동 알려줘', 5, now=NOW)
+        self.assertEqual([row['article_id'] for row in activity], [1])
+
+        controversy = retrieval.rank_candidates(
+            [article(1, '장원영 광고 화보', .9), article(2, '장원영 법적 대응 논란', .45)],
+            '장원영 논란 있었어?', 5, now=NOW)
+        self.assertEqual(controversy[0]['article_id'], 2)
 
     def test_activity_vs_controversy(self):
         rows = [article(1, '테스트가수 고소 사건 법원 판결', .8, '공연 이력'),
