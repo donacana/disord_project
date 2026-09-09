@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -10,6 +11,43 @@ load_dotenv(Path(__file__).with_name('.env'))
 
 class OpenAIServiceError(RuntimeError):
     """Raised when an OpenAI request cannot be completed."""
+
+
+def analyze_question(question: str) -> dict:
+    """Return query structure only; retrieved articles remain the fact source."""
+    model = os.getenv('OPENAI_CHAT_MODEL', 'gpt-4o-mini').strip() or 'gpt-4o-mini'
+    system_prompt = (
+        '너는 한국어 연예·문화 질문 분석기다. 질문에 직접 답하지 마라.\n'
+        'entity, intent, time_range, keywords, normalized_question, confidence만 JSON으로 반환하라.\n'
+        'entity는 질문에 있거나 명확한 별칭으로 확인되는 대상만 추출하고 확신이 없으면 null로 둬라.\n'
+        'intent는 definition, activity, controversy, comeback, movie, drama, show, event, trend, '
+        'trend_ranking, general 중 하나만 사용하라. time_range는 recent, today, week, month, year, '
+        'all, unknown 중 하나만 사용하라. 사실, 숫자, 프로필을 만들지 마라.\n'
+        '스키즈는 스트레이 키즈, 방탄은 BTS, 블핑은 BLACKPINK로 정규화할 수 있다.'
+    )
+    try:
+        response = _client().chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={'type': 'json_object'},
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': question},
+            ],
+        )
+        content = response.choices[0].message.content or ''
+        content = content.strip()
+        if content.startswith('```'):
+            content = content.strip('`')
+            content = content[content.find('{'):content.rfind('}') + 1]
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            raise ValueError('질문 분석 JSON이 object가 아닙니다.')
+        return payload
+    except OpenAIServiceError:
+        raise
+    except Exception as error:
+        raise OpenAIServiceError('질문 분석에 실패했습니다.') from error
 
 
 def _client() -> OpenAI:

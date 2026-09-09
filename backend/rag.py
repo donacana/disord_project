@@ -8,14 +8,18 @@ if __package__:
     from . import db
     from .openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
     from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from .query_utils import ARTICLE_INTENT_TERMS, analyze_query, expand_query
+    from .query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
+                               expand_query, merge_llm_analysis, rule_query_analysis,
+                               should_use_llm)
     from .retrieval import MIN_SIMILARITY, search
     from .schemas import AskResponse, SourceItem
 else:
     import db
     from openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
     from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from query_utils import ARTICLE_INTENT_TERMS, analyze_query, expand_query
+    from query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
+                             expand_query, merge_llm_analysis, rule_query_analysis,
+                             should_use_llm)
     from retrieval import MIN_SIMILARITY, search
     from schemas import AskResponse, SourceItem
 
@@ -28,11 +32,26 @@ class RAGError(RuntimeError):
     """Raised when embedding or answer generation fails."""
 
 
-def _search(question: str, top_k: int) -> list[dict]:
+def _query_analysis(question: str) -> tuple[QueryAnalysis, bool]:
+    rule = rule_query_analysis(question)
+    if not should_use_llm(rule):
+        return rule, False
     try:
-        hints = analyze_query(question)
-        embedding = embed_question(' | '.join(expand_query(question, hints)))
-        return search(embedding, question, top_k, MIN_SIMILARITY)
+        from .openai_client import analyze_question as llm_analyze_question
+    except ImportError:
+        from openai_client import analyze_question as llm_analyze_question
+    try:
+        return merge_llm_analysis(rule, llm_analyze_question(question)), True
+    except OpenAIServiceError:
+        logger.warning('Query understanding failed; using rule-based analysis.')
+        return rule, False
+
+
+def _search(question: str, top_k: int, analysis: QueryAnalysis | None = None) -> list[dict]:
+    try:
+        analysis = analysis or _query_analysis(question)[0]
+        embedding = embed_question(' | '.join(expand_query(question, analysis)))
+        return search(embedding, question, top_k, MIN_SIMILARITY, analysis=analysis)
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
 
@@ -72,13 +91,17 @@ def _source(article: dict) -> SourceItem:
     )
 
 
-def _title_fallback(question: str, reviewed: str, results: list[dict], checked):
+def _title_fallback(question: str, reviewed: str, results: list[dict], checked,
+                    analysis: QueryAnalysis | None = None):
     """Keep a directly relevant headline when an over-detailed review is pruned.
 
     Never override the verifier's explicit insufficiency verdict, and never
     infer performances/releases from a generic collaboration headline.
     """
     hints = analyze_query(question)
+    if analysis and analysis.entity:
+        hints = type(hints)(hints.keywords, (analysis.entity,), hints.intent, hints.categories,
+                            hints.strict_category, hints.recent_days)
     if checked.citation_ids or (reviewed.strip() == INSUFFICIENT_ANSWER
                                 and hints.intent != 'definition'):
         return checked
@@ -131,7 +154,8 @@ def _log_result(question: str, answer: str, results: list[dict], top_score: floa
 
 def answer_question(question: str, top_k: int) -> AskResponse:
     started = time.perf_counter()
-    results = _search(question, top_k)
+    analysis, llm_used = _query_analysis(question)
+    results = _search(question, top_k, analysis)
     if not results:
         answer = INSUFFICIENT_ANSWER
         _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
@@ -151,20 +175,24 @@ def answer_question(question: str, top_k: int) -> AskResponse:
         reviewed = INSUFFICIENT_ANSWER
         logger.warning('Answer verification failed; returning insufficient evidence response.')
     checked = validate_answer(reviewed, evidence)
-    checked = _title_fallback(question, reviewed, results, checked)
+    checked = _title_fallback(question, reviewed, results, checked, analysis)
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
-        hints = analyze_query(question)
-        expanded_queries = expand_query(question, hints)
-        if hints.intent == 'definition':
+        logger.warning('[QUERY] original=%s rule_intent=%s llm_used=%s entity=%s '
+                       'intent=%s time_range=%s confidence=%.2f normalized=%s keywords=%s',
+                       question, rule_query_analysis(question).intent, llm_used,
+                       analysis.entity, analysis.intent, analysis.time_range,
+                       analysis.confidence, analysis.normalized_question, list(analysis.keywords))
+        expanded_queries = expand_query(question, analysis)
+        if analysis.intent == 'definition':
             logger.warning('[definition] question=%s entity=%s expanded_queries=%s '
                            'candidate_count=%d final_docs=%d',
-                           question, ','.join(hints.entities), list(expanded_queries),
+                           question, analysis.entity, list(expanded_queries),
                            len(results), len(used_results))
         logger.warning('[RAG] question=%s intent=%s entity=%s after_filter=%d '
                        'generated_answer=%s validated_sentences=%d removed_sentences=%d',
-                       question, hints.intent, ','.join(hints.entities), len(results),
+                       question, analysis.intent, analysis.entity or '', len(results),
                        bool(draft.strip()), len(checked.citation_ids),
                        len(checked.removed_sentences))
         logger.warning('answer_validation draft_removed=%d final_removed=%d replaced=%d citations=%s',

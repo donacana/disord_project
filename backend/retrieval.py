@@ -10,11 +10,11 @@ from datetime import date, datetime, timezone
 
 if __package__:
     from . import config, db
-    from .query_utils import ARTICLE_INTENT_TERMS, QueryHints, analyze_query
+    from .query_utils import ARTICLE_INTENT_TERMS, QueryAnalysis, QueryHints, analysis_to_hints, analyze_query
 else:
     import config
     import db
-    from query_utils import ARTICLE_INTENT_TERMS, QueryHints, analyze_query
+    from query_utils import ARTICLE_INTENT_TERMS, QueryAnalysis, QueryHints, analysis_to_hints, analyze_query
 
 MIN_SIMILARITY = config.MIN_SIMILARITY
 logger = logging.getLogger(__name__)
@@ -206,8 +206,9 @@ def _select(rows: list[dict], hints: QueryHints, top_k: int) -> list[dict]:
 
 def rank_candidates(rows: list[dict], question: str, top_k: int,
                     min_similarity: float = MIN_SIMILARITY,
-                    now: datetime | None = None) -> list[dict]:
-    hints = analyze_query(question)
+                    now: datetime | None = None,
+                    analysis: QueryAnalysis | None = None) -> list[dict]:
+    hints = analysis_to_hints(analysis) if analysis else analyze_query(question)
     now = _datetime(now) or datetime.now(timezone.utc)
     eligible = []
     debug = os.getenv('RAG_DEBUG', '').casefold() == 'true'
@@ -228,12 +229,13 @@ def rank_candidates(rows: list[dict], question: str, top_k: int,
 
 
 def search(embedding: list[float], question: str, top_k: int,
-           min_similarity: float = MIN_SIMILARITY) -> list[dict]:
+           min_similarity: float = MIN_SIMILARITY,
+           analysis: QueryAnalysis | None = None) -> list[dict]:
     vector = '[' + ','.join(str(value) for value in embedding) + ']'
     candidate_count = min(config.MAX_CANDIDATES,
                           max(config.CANDIDATE_TOP_K, top_k * config.CANDIDATE_MULTIPLIER))
     rows = db.fetch_all(SEARCH_QUERY, (vector, vector, candidate_count))
-    ranked = rank_candidates(rows, question, top_k, min_similarity)
+    ranked = rank_candidates(rows, question, top_k, min_similarity, analysis=analysis)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
         logger.warning('[RAG] question=%s vector_candidates=%d after_rerank=%d final_docs=%d',
                        question, len(rows), len(ranked), len(ranked))

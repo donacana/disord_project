@@ -54,6 +54,11 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(result.citation_ids, (1,))
         unsupported = validate_answer('테스트그룹은 큰 인기를 끌고 있습니다.[1]', [EVIDENCE])
         self.assertEqual(unsupported.answer, INSUFFICIENT_ANSWER)
+        definition = validate_answer(
+            '스트레이 키즈는 그룹이며 최근 새 앨범을 발매했습니다.[1]',
+            ['그룹 스트레이 키즈가 새 앨범을 발매했습니다.'],
+        )
+        self.assertEqual(definition.citation_ids, (1,))
 
     def test_numeric_boundaries_and_units(self):
         evidence = '테스트그룹 2026년 11월 공연. 관객 12명. 가격 1.5만원.'
