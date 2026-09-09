@@ -56,3 +56,14 @@ Invoke-RestMethod http://127.0.0.1:8000/ask -Method Post -ContentType 'applicati
 
 기존 public.articles, public.article_embeddings, public.sources가 있어야 합니다.
 테이블이 없거나 접속이 실패한 경우 0건으로 숨기지 않고 오류를 반환합니다.
+
+## 검색 품질 개선 1단계
+
+- `retrieval.py`에서 cosine 후보를 `top_k * 4`개(최대 40개) 조회하고 최종 `top_k`개만 선택합니다.
+- 점수는 벡터 0.60 + 키워드 포함 비율 0.20 + 제목 포함 비율 0.15 + 최신성 0.05입니다.
+- `query_utils.py`는 불용어·간단한 조사를 제거합니다. 별도 고유명사 사전이나 NLP 모델은 없으므로 이름 추출은 휴리스틱입니다.
+- 최근/요즘/현재/근황/최신 질문에만 발행일 기준 7일 이내 1.0, 30일 이내 0.7, 90일 이내 0.3을 적용합니다. NULL 날짜는 0입니다.
+- `RAG_MIN_SIMILARITY`는 가산점 적용 전 cosine 유사도 임계값입니다. 미달 후보는 제외하고 결과 수를 억지로 채우지 않습니다. 키워드 미포함만으로 제외하지 않습니다.
+- 실제 샘플에서 0.45는 아이브 무관 기사를 줄였지만 영화 질문 결과를 모두 제거했고, 0.50은 아이브·장원영 결과도 제거했습니다. 따라서 기본값 0.3을 유지합니다. 기존 환경변수 설정이 우선하며 `.env`는 변경하지 않습니다.
+- `RAG_DEBUG=true`이면 각 후보의 vector/keyword/title/recency/final 및 임계값 통과 여부를 로그로 출력합니다. 점수는 API 응답에 추가하지 않습니다. 기존 qa_logs 점수는 cosine 유사도를 유지합니다.
+- 회귀 테스트: 프로젝트 루트에서 `backend/.venv/Scripts/python.exe -m unittest backend.test_retrieval`. DB/OpenAI를 모킹한 테스트이며 실서비스 연결 테스트와 구분합니다.
