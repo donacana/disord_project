@@ -19,6 +19,7 @@ jobs:
         run: python collector/collector.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PUBLIC_DATA_API_KEY: ${{ secrets.PUBLIC_DATA_API_KEY }}
 
       - name: 네이버 수집
         run: python collector/sources_naver.py

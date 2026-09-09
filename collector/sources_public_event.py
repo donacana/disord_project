@@ -105,7 +105,6 @@ def _request_page(
 ):
     """공공 API의 한 페이지를 요청하고 XML 루트를 반환합니다."""
     params = {
-        "serviceKey": api_key,
         "PageNo": page,
         "numOfrows": rows,
         "keyword": "",
@@ -118,9 +117,10 @@ def _request_page(
         "to": end_date.strftime("%Y%m%d"),
     }
 
+    url_with_key = f"{PUBLIC_EVENT_API_URL}?serviceKey={api_key}"
     try:
         response = requests.get(
-            PUBLIC_EVENT_API_URL,
+            url_with_key,
             params=params,
             timeout=20,
         )
@@ -160,9 +160,7 @@ def fetch_public_events(
 
     한 페이지당 최대 100건, 최대 10페이지까지 조회합니다.
     """
-    api_key = unquote(
-        os.getenv("PUBLIC_DATA_API_KEY", "").strip()
-    )
+    api_key = os.getenv("PUBLIC_DATA_API_KEY", "").strip()
 
     if not api_key:
         raise PublicEventAPIError(
