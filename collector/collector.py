@@ -13,12 +13,13 @@ import hashlib
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
+from sources_rss import EXTRA_RSS_SOURCES
+from keyword_extractor import extract_keywords
+
 import feedparser
 import trafilatura
 import psycopg
 from dotenv import load_dotenv
-
-from sources_rss import EXTRA_RSS_SOURCES
 
 # ── 환경변수 로드 ──────────────────────────────────────────────
 load_dotenv()
@@ -103,6 +104,7 @@ def fetch_articles():
                 "published_at": entry.get("published") or datetime.now().isoformat(),
                 "source_name": source["source_name"],
                 "category": guess_category(entry.title, source["category"]),
+                "keywords": extract_keywords(entry.title),
             })
     return articles
 
@@ -125,14 +127,15 @@ def save_article(conn, article: dict, content: str, source_id: int):
             """
             INSERT INTO articles
                 (domain, category, title, content, url, url_hash,
-                 source_id, source_name, published_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 source_id, source_name, published_at, keywords)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (url_hash) DO NOTHING
             RETURNING id
             """,
             (
                 "culture", article["category"], article["title"], content,
-                article["url"], h, source_id, article["source_name"], article["published_at"],
+                article["url"], h, source_id, article["source_name"],
+                article["published_at"], article["keywords"],
             ),
         )
         row = cur.fetchone()
