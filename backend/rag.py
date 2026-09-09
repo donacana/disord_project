@@ -1,19 +1,19 @@
 import json
-import os
 import time
 from datetime import datetime
 
 if __package__:
     from . import db
     from .openai_client import OpenAIServiceError, embed_question, generate_answer
+    from .retrieval import MIN_SIMILARITY, search
     from .schemas import AskResponse, SourceItem
 else:
     import db
     from openai_client import OpenAIServiceError, embed_question, generate_answer
+    from retrieval import MIN_SIMILARITY, search
     from schemas import AskResponse, SourceItem
 
 
-MIN_SIMILARITY = float(os.getenv('RAG_MIN_SIMILARITY', '0.3'))
 MAX_CONTEXT_CHARS = 4000
 
 
@@ -21,47 +21,12 @@ class RAGError(RuntimeError):
     """Raised when embedding or answer generation fails."""
 
 
-SEARCH_QUERY = """
-SELECT
-    a.id AS article_id,
-    a.title,
-    a.content,
-    a.summary,
-    a.url,
-    a.source_name,
-    a.category,
-    a.published_at,
-    a.collected_at,
-    ae.embedding <=> %s::vector AS distance
-FROM public.article_embeddings ae
-JOIN public.articles a ON a.id = ae.article_id
-ORDER BY ae.embedding <=> %s::vector
-LIMIT %s
-"""
-
-
-def _vector_literal(values: list[float]) -> str:
-    return '[' + ','.join(str(value) for value in values) + ']'
-
-
 def _search(question: str, top_k: int) -> list[dict]:
     try:
         embedding = embed_question(question)
-        vector = _vector_literal(embedding)
-        rows = db.fetch_all(SEARCH_QUERY, (vector, vector, top_k))
+        return search(embedding, question, top_k, MIN_SIMILARITY)
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
-
-    results = []
-    for row in rows:
-        distance = float(row['distance'])
-        similarity = 1 - distance
-        if similarity >= MIN_SIMILARITY:
-            row['distance'] = distance
-            row['similarity'] = similarity
-            results.append(row)
-    return results
-
 
 def _context(results: list[dict]) -> str:
     sections = []
