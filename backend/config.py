@@ -1,0 +1,36 @@
+"""Retrieval policy; no API or model configuration changes."""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).with_name('.env'))
+
+# Retain the stage-one proportions within the 70% base score. The remaining
+# 30% measures direct entity, intent and category evidence (see comparison).
+VECTOR_WEIGHT = 0.42
+KEYWORD_WEIGHT = 0.14
+TITLE_WEIGHT = 0.105
+RECENCY_WEIGHT = 0.035
+ENTITY_WEIGHT = 0.15
+INTENT_WEIGHT = 0.10
+CATEGORY_WEIGHT = 0.05
+
+MIN_SIMILARITY = float(os.getenv('RAG_MIN_SIMILARITY', '0.3'))
+CANDIDATE_MULTIPLIER = 4
+MAX_CANDIDATES = 40
+FINAL_SCORE_FLOOR = 0.15
+ENTITY_SCORE_FLOOR = 0.35
+TITLE_RESCUE_MARGIN = 0.10
+TITLE_RESCUE_FLOOR = 0.20
+INDIRECT_MIN_SIMILARITY = 0.65
+INDIRECT_SCORE_FLOOR = 0.40
+CATEGORY_MISMATCH_PENALTY = 0.08
+ACTIVITY_CONFLICT_PENALTY = 0.20
+POSITIVE_INTENTS = {'activity', 'advertisement', 'event', 'music_release', 'movie_release'}
+ENTITY_MISMATCH_PENALTY = 0.10
+SOURCE_LIMIT = 2
+# Diversity only reorders alternatives within this relevance gap.
+DIVERSITY_SCORE_GAP = 0.08
+DEFAULT_RECENT_DAYS = 30
