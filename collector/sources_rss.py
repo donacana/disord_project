@@ -17,5 +17,24 @@ EXTRA_RSS_SOURCES = [
     # 아래 형식 그대로 추가하세요. 예시:
     # {"source_name": "언론사이름", "url": "RSS주소", "category": "celeb"},
 
-    {"source_name": "TODO: 언론사 이름", "url": "TODO: RSS 주소", "category": "TODO"},
+    {
+        "source_name": "SBS",
+        "url": "https://news.sbs.co.kr/news/SectionRssFeed.do?sectionId=14&plink=RSSREADER",
+        "category": "celeb",
+    },
+    {
+        "source_name": "조선일보",
+        "url": "https://www.chosun.com/arc/outboundfeeds/rss/category/entertainments/?outputType=xml",
+        "category": "celeb",
+    },
+{
+        "source_name": "뉴시스",
+        "url": "https://www.newsis.com/RSS/entertain.xml",
+        "category": "celeb",
+    },
+    {
+        "source_name": "국민일보",
+        "url": "https://www.kmib.co.kr/rss/data/kmibEntRss.xml",
+        "category": "celeb",
+    },
 ]
