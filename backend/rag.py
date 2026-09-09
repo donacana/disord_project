@@ -1,20 +1,25 @@
 import json
+import logging
+import os
 import time
 from datetime import datetime
 
 if __package__:
     from . import db
-    from .openai_client import OpenAIServiceError, embed_question, generate_answer
+    from .openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
+    from .answer_validator import INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from .retrieval import MIN_SIMILARITY, search
     from .schemas import AskResponse, SourceItem
 else:
     import db
-    from openai_client import OpenAIServiceError, embed_question, generate_answer
+    from openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
+    from answer_validator import INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from retrieval import MIN_SIMILARITY, search
     from schemas import AskResponse, SourceItem
 
 
 MAX_CONTEXT_CHARS = 4000
+logger = logging.getLogger(__name__)
 
 
 class RAGError(RuntimeError):
@@ -28,18 +33,30 @@ def _search(question: str, top_k: int) -> list[dict]:
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
 
+def _article_body(article: dict) -> str:
+    return (article['summary'] or article['content'] or '')[:MAX_CONTEXT_CHARS]
+
+
+def _evidence(results: list[dict]) -> list[str]:
+    # No unseen full content, URLs or publication dates can substantiate a
+    # factual claim. Validate against the exact title/body sent to the model.
+    return [f'{article["title"]}\n{_article_body(article)}' for article in results]
+
+
 def _context(results: list[dict]) -> str:
     sections = []
     for index, article in enumerate(results, start=1):
         published_at = article['published_at'] or '미상'
-        body = (article['summary'] or article['content'] or '')[:MAX_CONTEXT_CHARS]
+        body = _article_body(article)
         sections.append(
+            f'--- ARTICLE {index} START ---\n'
             f'[{index}]\n'
             f'제목: {article["title"]}\n'
             f'출처: {article["source_name"]}\n'
             f'발행일: {published_at}\n'
-            f'내용: {body}\n'
-            f'URL: {article["url"]}'
+            f'본문: {body}\n'
+            f'URL: {article["url"]}\n'
+            f'--- ARTICLE {index} END ---'
         )
     return '\n\n'.join(sections)
 
@@ -78,24 +95,40 @@ def answer_question(question: str, top_k: int) -> AskResponse:
     started = time.perf_counter()
     results = _search(question, top_k)
     if not results:
-        answer = '현재 수집된 자료에서 관련 정보를 찾지 못했습니다.'
+        answer = INSUFFICIENT_ANSWER
         _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
         return AskResponse(answer=answer, sources=[], domain='ent_culture')
 
     try:
-        answer = generate_answer(question, _context(results))
+        context = _context(results)
+        draft = generate_answer(question, context)
     except OpenAIServiceError as error:
         raise RAGError(str(error)) from error
+    evidence = _evidence(results)
+    draft_check = validate_answer(draft, evidence)
+    try:
+        reviewed = verify_answer(question, context, draft)
+    except OpenAIServiceError:
+        # Never return an unverified draft on verifier failure.
+        reviewed = INSUFFICIENT_ANSWER
+        logger.warning('Answer verification failed; returning insufficient evidence response.')
+    checked = validate_answer(reviewed, evidence)
+    used_results = [results[number - 1] for number in checked.citation_ids]
+    answer = remap_citations(checked.answer, checked.citation_ids)
+    if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+        logger.warning('answer_validation draft_removed=%d final_removed=%d citations=%s',
+                       len(draft_check.removed_sentences), len(checked.removed_sentences),
+                       checked.citation_ids)
     _log_result(
         question,
         answer,
-        results,
-        results[0]['similarity'],
-        True,
+        used_results,
+        used_results[0]['similarity'] if used_results else None,
+        bool(used_results),
         int((time.perf_counter() - started) * 1000),
     )
     return AskResponse(
         answer=answer,
-        sources=[_source(article) for article in results],
+        sources=[_source(article) for article in used_results],
         domain='ent_culture',
     )
