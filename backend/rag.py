@@ -5,22 +5,28 @@ import time
 from datetime import datetime
 
 if __package__:
+    from . import config
     from . import db
-    from .openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
+    from .openai_client import (OpenAIServiceError, embed_question, generate_answer,
+                                generate_trend_answer, verify_answer)
     from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from .query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
                                expand_query, merge_llm_analysis, rule_query_analysis,
                                should_use_llm)
     from .retrieval import MIN_SIMILARITY, search
+    from . import trend_service
     from .schemas import AskResponse, SourceItem
 else:
+    import config
     import db
-    from openai_client import OpenAIServiceError, embed_question, generate_answer, verify_answer
+    from openai_client import (OpenAIServiceError, embed_question, generate_answer,
+                               generate_trend_answer, verify_answer)
     from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
     from query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
                              expand_query, merge_llm_analysis, rule_query_analysis,
                              should_use_llm)
     from retrieval import MIN_SIMILARITY, search
+    import trend_service
     from schemas import AskResponse, SourceItem
 
 
@@ -152,9 +158,92 @@ def _log_result(question: str, answer: str, results: list[dict], top_score: floa
         return
 
 
+def _trend_category_hint(analysis: QueryAnalysis) -> str | None:
+    question = analysis.original_question.casefold()
+    if any(term in question for term in ('아이돌', '걸그룹', '보이그룹', '그룹')):
+        return 'idol'
+    if any(term in question for term in ('배우', '연기자')):
+        return 'actor'
+    return None
+
+
+def _trend_articles(items: list[trend_service.TrendItem]) -> list[dict]:
+    articles = []
+    for item in items:
+        representative = item.articles[0] if item.articles else {}
+        article = dict(representative)
+        article['title'] = representative.get('title') or item.name
+        article['content'] = (f'집계 대상: {item.name}. '
+                              f'최근 수집 기사 {item.mention_count}건, '
+                              f'언론사 {item.source_count}곳, '
+                              f'최신 기사 {item.latest_at.isoformat() if item.latest_at else "미상"}.')
+        article['summary'] = None
+        article['url'] = representative.get('url') or f'trend://{item.name}'
+        article['collected_at'] = representative.get('collected_at')
+        article['similarity'] = item.score
+        articles.append(article)
+    return articles
+
+
+def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResponse:
+    now = datetime.now().astimezone()
+    items, scanned = trend_service.aggregate(
+        analysis.time_range,
+        top_k=min(top_k, config.TREND_TOP_K),
+        category_hint=_trend_category_hint(analysis),
+        now=now,
+    )
+    if not items:
+        answer = INSUFFICIENT_ANSWER
+        _log_result(question, answer, [], None, False, 0)
+        return AskResponse(answer=answer, sources=[], domain='ent_culture')
+    results = _trend_articles(items)
+    context = '\n'.join(
+        f'[{index}] {item.name}: 기사 {item.mention_count}건, 언론사 {item.source_count}곳, '
+        f'최신일 {item.latest_at.date().isoformat() if item.latest_at else "미상"}'
+        for index, item in enumerate(items, start=1)
+    )
+    try:
+        draft = generate_trend_answer(question, context)
+    except OpenAIServiceError:
+        draft = ('최근 수집 기사 기준으로는 ' + ', '.join(
+            f'{item.name}({item.mention_count}건)' for item in items
+        ) + '이(가) 많이 언급됐습니다.' + ''.join(
+            f'[{index}]' for index in range(1, len(items) + 1)
+        ))
+    evidence = [
+        f'최근 수집 기사 기준으로 {item.name}이(가) {item.mention_count}건으로 집계됐습니다. '
+        f'{item.name}: 기사 {item.mention_count}건, 언론사 {item.source_count}곳, '
+        f'최신일 {item.latest_at.date().isoformat() if item.latest_at else "미상"}\n{article["title"]}'
+        for item, article in zip(items, results)
+    ]
+    checked = validate_answer(draft, evidence)
+    if not checked.citation_ids:
+        fallback = '\n'.join(
+            f'최근 수집 기사 기준으로 {item.name}이(가) {item.mention_count}건으로 집계됐습니다.[{index}]'
+            for index, item in enumerate(items, start=1)
+        )
+        checked = validate_answer(fallback, evidence)
+    used = [results[index - 1] for index in checked.citation_ids]
+    answer = remap_citations(checked.answer, checked.citation_ids)
+    if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+        logger.warning('[TREND] intent=%s time_range=%s period_days=%d articles_scanned=%d '
+                       'entities_found=%d eligible_entities=%d top_entities=%s',
+                       analysis.intent, analysis.time_range,
+                       trend_service.period_days(analysis.time_range), scanned,
+                       len(items), len(used),
+                       [(item.name, item.mention_count, item.source_count, round(item.score, 3))
+                        for item in items])
+    _log_result(question, answer, used, used[0].get('similarity') if used else None,
+                bool(used), 0)
+    return AskResponse(answer=answer, sources=[_source(article) for article in used], domain='ent_culture')
+
+
 def answer_question(question: str, top_k: int) -> AskResponse:
     started = time.perf_counter()
     analysis, llm_used = _query_analysis(question)
+    if analysis.intent == 'trend_ranking':
+        return _answer_trend(question, analysis, top_k)
     results = _search(question, top_k, analysis)
     if not results:
         answer = INSUFFICIENT_ANSWER

@@ -185,7 +185,8 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
         intent = 'trend_ranking'
     elif hints.intent == 'music_release':
         intent = 'comeback'
-    elif hints.intent in {'definition', 'activity', 'controversy', 'movie', 'drama', 'event'}:
+    elif hints.intent in {'definition', 'activity', 'controversy', 'movie', 'drama', 'event',
+                          'trend_ranking'}:
         intent = hints.intent
     elif any(term in compact for term in ('아이돌컴백', '최근컴백', '컴백한')):
         intent = 'comeback'
@@ -234,6 +235,8 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
     intent = rule.intent if not raw_intent else _canonical_intent(raw_intent)
     if raw_intent is None and rule.intent != 'general':
         intent = rule.intent
+    if rule.intent == 'trend_ranking' and intent == 'trend':
+        intent = 'trend_ranking'
     time_range = payload.get('time_range')
     if time_range not in ALLOWED_TIME_RANGES:
         time_range = rule.time_range

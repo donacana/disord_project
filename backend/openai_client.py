@@ -154,6 +154,34 @@ def generate_answer(question: str, context: str) -> str:
         raise OpenAIServiceError('LLM 답변 생성에 실패했습니다.') from error
 
 
+def generate_trend_answer(question: str, context: str) -> str:
+    """Format precomputed ranking data; never infer or add ranking entities."""
+    model = os.getenv('OPENAI_CHAT_MODEL', 'gpt-4o-mini').strip() or 'gpt-4o-mini'
+    prompt = (
+        '너는 수집 기사 트렌드 집계 결과를 한국어로 짧게 정리하는 formatter다.\n'
+        '제공된 집계 결과에 있는 이름과 수치만 사용하라. 새 인물, 그룹, 순위, 평가를 추가하지 마라.\n'
+        '반드시 "최근 수집 기사 기준"임을 명시하고, 각 문장 끝에 실제 [번호]를 붙여라.\n'
+        '한 줄에 한 문장, 최대 3문장으로 작성하라.\n'
+    )
+    try:
+        response = _client().chat.completions.create(
+            model=model,
+            temperature=0,
+            messages=[
+                {'role': 'system', 'content': prompt},
+                {'role': 'user', 'content': f'질문:\n{question}\n\n집계 결과:\n{context}'},
+            ],
+        )
+        answer = response.choices[0].message.content
+        if not answer:
+            raise OpenAIServiceError('트렌드 답변이 비어 있습니다.')
+        return answer.strip()
+    except OpenAIServiceError:
+        raise
+    except Exception as error:
+        raise OpenAIServiceError('트렌드 답변 생성에 실패했습니다.') from error
+
+
 def verify_answer(question: str, context: str, draft: str) -> str:
     """One semantic verification pass with the same configured chat model."""
     model = os.getenv('OPENAI_CHAT_MODEL', 'gpt-4o-mini').strip() or 'gpt-4o-mini'
