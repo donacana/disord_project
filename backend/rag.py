@@ -9,8 +9,9 @@ if __package__:
     from . import db
     from .openai_client import (OpenAIServiceError, embed_question, generate_answer,
                                 generate_trend_answer, verify_answer)
-    from .answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from .query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
+    from .answer_validator import (CITATION, INSUFFICIENT_ANSWER, remap_citations,
+                                   sentences, validate_answer)
+    from .query_utils import (ARTICLE_INTENT_TERMS, GENERAL_TERMS, QueryAnalysis, analyze_query,
                                expand_query, merge_llm_analysis, rule_query_analysis)
     from .retrieval import MIN_SIMILARITY, search
     from . import trend_service
@@ -20,8 +21,9 @@ else:
     import db
     from openai_client import (OpenAIServiceError, embed_question, generate_answer,
                                generate_trend_answer, verify_answer)
-    from answer_validator import CITATION, INSUFFICIENT_ANSWER, remap_citations, validate_answer
-    from query_utils import (ARTICLE_INTENT_TERMS, QueryAnalysis, analyze_query,
+    from answer_validator import (CITATION, INSUFFICIENT_ANSWER, remap_citations,
+                                 sentences, validate_answer)
+    from query_utils import (ARTICLE_INTENT_TERMS, GENERAL_TERMS, QueryAnalysis, analyze_query,
                              expand_query, merge_llm_analysis, rule_query_analysis)
     from retrieval import MIN_SIMILARITY, search
     import trend_service
@@ -73,6 +75,20 @@ def _evidence(results: list[dict]) -> list[str]:
     # No unseen full content, URLs or publication dates can substantiate a
     # factual claim. Validate against the exact title/body sent to the model.
     return [f'{article["title"]}\n{_article_body(article)}' for article in results]
+
+
+def _has_related_evidence(question: str, results: list[dict], analysis: QueryAnalysis) -> bool:
+    if not results:
+        return False
+    texts = [f'{article["title"]} {article["content"] or ""}'.casefold()
+             for article in results]
+    if analysis.entity and any(analysis.entity.casefold() in text for text in texts):
+        return True
+    hints = analyze_query(question)
+    keywords = [word.casefold() for word in hints.keywords
+                if word.casefold() not in {term.casefold() for term in GENERAL_TERMS}
+                and word.casefold() not in {'최근', '요즘', '알려줘'}]
+    return bool(keywords) and any(any(word in text for word in keywords) for text in texts)
 
 
 def _context(results: list[dict]) -> str:
@@ -250,6 +266,11 @@ def answer_question(question: str, top_k: int) -> AskResponse:
         return _answer_trend(question, analysis, top_k)
     results = _search(question, top_k, analysis)
     if not results:
+        if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+            logger.warning('[RAG] question=%s intent=%s entity=%s candidate_docs=0 '
+                           'final_docs=0 generated_sentences=0 supported_sentences=0 '
+                           'removed_sentences=0 insufficient_reason=no_retrieval_results',
+                           question, analysis.intent, analysis.entity or '')
         answer = INSUFFICIENT_ANSWER
         _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
         return AskResponse(answer=answer, sources=[], domain='ent_culture')
@@ -264,10 +285,14 @@ def answer_question(question: str, top_k: int) -> AskResponse:
     try:
         reviewed = verify_answer(question, context, draft)
     except OpenAIServiceError:
-        # Never return an unverified draft on verifier failure.
+        # The local validator still protects the draft when semantic review fails.
         reviewed = INSUFFICIENT_ANSWER
-        logger.warning('Answer verification failed; returning insufficient evidence response.')
+        logger.warning('Answer verification failed; using locally validated draft where possible.')
     checked = validate_answer(reviewed, evidence)
+    if (not checked.citation_ids and draft_check.citation_ids
+            and _has_related_evidence(question, results, analysis)):
+        checked = draft_check
+        logger.info('Verifier removed all claims; restored locally grounded draft sentences.')
     checked = _title_fallback(question, reviewed, results, checked, analysis)
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
@@ -285,10 +310,12 @@ def answer_question(question: str, top_k: int) -> AskResponse:
                            question, analysis.entity, list(expanded_queries),
                            len(results), len(used_results))
         logger.warning('[RAG] question=%s intent=%s entity=%s after_filter=%d '
-                       'generated_answer=%s validated_sentences=%d removed_sentences=%d',
+                       'generated_answer=%s generated_sentences=%d validated_sentences=%d removed_sentences=%d',
                        question, analysis.intent, analysis.entity or '', len(results),
-                       bool(draft.strip()), len(checked.citation_ids),
+                       bool(draft.strip()), len(sentences(draft)), len(checked.citation_ids),
                        len(checked.removed_sentences))
+        if not checked.citation_ids:
+            logger.warning('[RAG] insufficient_reason=no_supported_sentence_after_validation')
         logger.warning('answer_validation draft_removed=%d final_removed=%d replaced=%d citations=%s',
                        len(draft_check.removed_sentences), len(checked.removed_sentences),
                        len(checked.replaced_sentences), checked.citation_ids)

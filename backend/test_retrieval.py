@@ -193,7 +193,7 @@ class RetrievalTests(unittest.TestCase):
         rows = [article(1, '테스트가수 고소 사건 법원 판결', .8, '공연 이력'),
                 article(2, '테스트가수 앨범 발매 공연', .5)]
         activity = retrieval.rank_candidates(rows, '테스트가수 최근 활동 알려줘', 5, now=NOW)
-        self.assertEqual([r['article_id'] for r in activity], [2])
+        self.assertEqual([r['article_id'] for r in activity], [2, 1])
         controversy = retrieval.rank_candidates(rows, '테스트가수 논란 있었어?', 5, now=NOW)
         self.assertEqual(controversy[0]['article_id'], 1)
 
@@ -223,7 +223,7 @@ class RetrievalTests(unittest.TestCase):
                 article(3, '영화 개봉주 무대인사', .45)]
         rows[2]['category'] = 'webtoon'
         ranked = retrieval.rank_candidates(rows, '최근 영화 개봉작 알려줘', 5, now=NOW)
-        self.assertEqual([r['article_id'] for r in ranked], [3])
+        self.assertEqual([r['article_id'] for r in ranked], [1, 3, 2])
 
     def test_source_diversity_and_shortage(self):
         rows = [article(i, f'문화 소식 {i}', .7 - i * .005) for i in range(1, 7)]
@@ -275,6 +275,13 @@ class RetrievalTests(unittest.TestCase):
         rescued = retrieval.rank_candidates([article(1, '테스트가수', .29)], '테스트가수', 5, .3, NOW)
         self.assertEqual(len(rescued), 1)
         self.assertEqual(retrieval.rank_candidates([article(1, '테스트가수', .29)], '테스트가수', 5, .5, NOW), [])
+        weak_title = retrieval.rank_candidates(
+            [article(1, '테스트가수 새 앨범 발표', .16)], '테스트가수 최근 활동', 5, .3, NOW)
+        self.assertEqual([row['article_id'] for row in weak_title], [1])
+        weak_body = retrieval.rank_candidates(
+            [article(1, '새 앨범 발표', .16, content='테스트가수의 새 앨범 활동')],
+            '테스트가수 최근 활동', 5, .3, NOW)
+        self.assertEqual([row['article_id'] for row in weak_body], [1])
         weights = [config.VECTOR_WEIGHT, config.KEYWORD_WEIGHT, config.TITLE_WEIGHT, config.RECENCY_WEIGHT,
                    config.ENTITY_WEIGHT, config.INTENT_WEIGHT, config.CATEGORY_WEIGHT]
         self.assertAlmostEqual(sum(weights), 1.0)

@@ -113,28 +113,35 @@ def score_candidate(row: dict, hints: QueryHints, now: datetime) -> dict | None:
 
 def _eligible(row: dict, hints: QueryHints, min_similarity: float) -> bool:
     effective_min_similarity = max(0.0, min_similarity - config.SIMILARITY_MARGIN)
+    direct_evidence = bool(
+        (hints.entities and row['entity_score'] > 0)
+        or row['title_score'] > 0
+        or row['keyword_score'] > 0
+    )
+    direct_rescue = (direct_evidence
+                     and min_similarity <= MIN_SIMILARITY + config.SIMILARITY_MARGIN
+                     and row['similarity'] >= config.DIRECT_MATCH_SIMILARITY_FLOOR
+                     and row['final_score'] >= config.DIRECT_MATCH_SCORE_FLOOR)
     # A bounded rescue for exact title/entity evidence; never bypass a configured
     # threshold by more than the margin, and never rescue nonpositive vectors.
     title_rescue = (bool(hints.entities) and row['entity_title_score'] == 1.0
                     and row['similarity'] >= max(config.TITLE_RESCUE_FLOOR,
                                                 effective_min_similarity - config.TITLE_RESCUE_MARGIN)
                     and row['final_score'] >= config.ENTITY_SCORE_FLOOR)
-    if row['similarity'] < effective_min_similarity and not title_rescue:
+    if row['similarity'] < effective_min_similarity and not title_rescue and not direct_rescue:
         return False
-    if row['final_score'] < config.FINAL_SCORE_FLOOR or row['intent_conflict']:
+    if row['final_score'] < config.FINAL_SCORE_FLOOR and not direct_rescue:
         return False
     if hints.entities:
         if row['entity_score']:
-            return row['final_score'] >= config.ENTITY_SCORE_FLOOR
+            return row['final_score'] >= config.ENTITY_SCORE_FLOOR or direct_rescue
         # Missing entity is not an unconditional veto, but indirect results need
         # strong vector, title intent AND category evidence, and a separate cap.
         return (row['similarity'] >= max(effective_min_similarity, config.INDIRECT_MIN_SIMILARITY)
                 and row['intent_score'] == 1.0 and row['category_score'] == 1.0
                 and row['final_score'] >= config.INDIRECT_SCORE_FLOOR)
     if hints.intent or hints.categories:
-        if hints.intent == 'movie_release' and not row['intent_score']:
-            return False
-        return bool(row['intent_score'] or row['category_score'] or row['keyword_score'])
+        return bool(row['intent_score'] or row['category_score'] or row['keyword_score'] or direct_rescue)
     return True
 
 

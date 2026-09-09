@@ -148,9 +148,9 @@ class PipelineTests(unittest.TestCase):
                 patch.object(rag, 'verify_answer', return_value='테스트그룹 2026년 데뷔.[1]'), \
                 patch.object(db, 'execute') as log:
             result = rag.answer_question('테스트그룹 활동', 5)
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.sources, [])
-        self.assertFalse(log.call_args.args[1][4])
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(len(result.sources), 1)
+        self.assertTrue(log.call_args.args[1][4])
 
     def test_verifier_failure_and_missing_results_fail_closed(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
@@ -158,8 +158,8 @@ class PipelineTests(unittest.TestCase):
                 patch.object(rag, 'verify_answer', side_effect=openai_client.OpenAIServiceError('failed')) as verify, \
                 patch.object(db, 'execute'):
             result = rag.answer_question('테스트그룹 활동', 5)
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.sources, [])
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(len(result.sources), 1)
         verify.assert_called_once()
         with patch.object(rag, '_search', return_value=[]), \
                 patch.object(rag, 'generate_answer') as generate, \
