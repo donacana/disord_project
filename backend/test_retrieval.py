@@ -286,7 +286,8 @@ class RetrievalTests(unittest.TestCase):
                    config.ENTITY_WEIGHT, config.INTENT_WEIGHT, config.CATEGORY_WEIGHT]
         self.assertAlmostEqual(sum(weights), 1.0)
 
-    def test_api_contract_context_and_logging(self):
+    @patch.object(rag, '_query_analysis', side_effect=lambda q: (rule_query_analysis(q), False))
+    def test_api_contract_context_and_logging(self, _analysis):
         client = TestClient(main.app)
         rows = [article(1, '아이브 월드투어'), article(2, 'ITZY 소식')]
         with patch.object(db, 'fetch_one', return_value={'ok': 1}):

@@ -13,7 +13,7 @@ API_BASE_URL = os.getenv(
     "http://127.0.0.1:8000",
 ).strip().rstrip("/")
 
-API_TIMEOUT_SECONDS = 60.0
+API_TIMEOUT_SECONDS = float(os.getenv('API_TIMEOUT_SECONDS', '180'))
 
 
 def validate_config() -> None:

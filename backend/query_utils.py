@@ -94,6 +94,22 @@ class QueryAnalysis:
     keywords: tuple[str, ...]
     search_queries: tuple[str, ...]
     confidence: float
+    target_type: str = 'entertainer'
+
+
+def target_type(question: str) -> str:
+    if any(term in question for term in ('아이돌', '그룹')):
+        return 'idol_or_group'
+    if any(term in question for term in ('배우', '연기자')):
+        return 'actor'
+    return 'entertainer'
+
+
+def is_ranking_question(question: str) -> bool:
+    compact = re.sub(r'\s+', '', question)
+    population = any(term in compact for term in ('누가', '누구', '어떤아이돌', '아이돌', '배우', '그룹', '연예인', '화제인물'))
+    ranking = any(term in compact for term in ('유명', '핫', '뜨는', '화제', '많이언급', '활동이많', '활동많'))
+    return population and ranking
 
 
 def _canonical_intent(intent: str | None) -> str:
@@ -183,7 +199,7 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
     entity = _alias(entity)
     if '무슨일' in compact or '무슨일이' in compact or '무슨 일' in question:
         intent = 'controversy'
-    elif any(re.sub(r'\s+', '', term) in compact for term in INTENT_TERMS['trend_ranking']):
+    elif is_ranking_question(question):
         intent = 'trend_ranking'
     elif hints.intent == 'music_release':
         intent = 'comeback'
@@ -217,13 +233,15 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
     if any(term in compact for term in ('뭐함', '뭐해', '있음', '누군데')):
         confidence -= 0.15
     analysis_intent = _canonical_intent(intent)
+    if analysis_intent == 'trend_ranking':
+        entity = None
     fallback = QueryAnalysis(question, normalized.strip(), entity, analysis_intent,
                              _time_range(question), tuple(hints.keywords), (),
                              max(0.0, confidence))
     return QueryAnalysis(fallback.original_question, fallback.normalized_question,
                          fallback.entity, fallback.intent, fallback.time_range,
                          fallback.keywords, _fallback_search_queries(fallback),
-                         fallback.confidence)
+                         fallback.confidence, target_type(question))
 
 
 def _fallback_search_queries(analysis: QueryAnalysis) -> tuple[str, ...]:
@@ -274,8 +292,11 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
         confidence = max(0.0, min(1.0, float(payload.get('confidence', rule.confidence))))
     except (TypeError, ValueError):
         confidence = rule.confidence
+    target = payload.get('target_type', rule.target_type)
+    if target not in {'idol_or_group', 'actor', 'entertainer', 'work', 'general'}:
+        target = rule.target_type
     return QueryAnalysis(rule.original_question, normalized.strip(), entity, intent, time_range,
-                         keywords, search_queries, confidence)
+                         keywords, search_queries, confidence, target)
 
 
 def analysis_to_hints(analysis: QueryAnalysis) -> QueryHints:

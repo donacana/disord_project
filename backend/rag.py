@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 if __package__:
-    from . import config
+    from . import config, diagnostics
     from . import db
     from .openai_client import (OpenAIServiceError, embed_question, generate_answer,
                                 generate_trend_answer, verify_answer)
@@ -18,6 +18,7 @@ if __package__:
     from .schemas import AskResponse, SourceItem
 else:
     import config
+    import diagnostics
     import db
     from openai_client import (OpenAIServiceError, embed_question, generate_answer,
                                generate_trend_answer, verify_answer)
@@ -80,8 +81,7 @@ def _evidence(results: list[dict]) -> list[str]:
 def _has_related_evidence(question: str, results: list[dict], analysis: QueryAnalysis) -> bool:
     if not results:
         return False
-    texts = [f'{article["title"]} {article["content"] or ""}'.casefold()
-             for article in results]
+    texts = [text.casefold() for text in _evidence(results)]
     if analysis.entity and any(analysis.entity.casefold() in text for text in texts):
         return True
     hints = analyze_query(question)
@@ -121,15 +121,14 @@ def _title_fallback(question: str, reviewed: str, results: list[dict], checked,
                     analysis: QueryAnalysis | None = None):
     """Keep a directly relevant headline when an over-detailed review is pruned.
 
-    Never override the verifier's explicit insufficiency verdict, and never
-    infer performances/releases from a generic collaboration headline.
+    Preserve explicit article facts even if the generated draft was rejected;
+    never infer performances/releases from a generic collaboration headline.
     """
     hints = analyze_query(question)
     if analysis and analysis.entity:
         hints = type(hints)(hints.keywords, (analysis.entity,), hints.intent, hints.categories,
                             hints.strict_category, hints.recent_days)
-    if checked.citation_ids or (reviewed.strip() == INSUFFICIENT_ANSWER
-                                and hints.intent != 'definition'):
+    if checked.citation_ids:
         return checked
     terms = ARTICLE_INTENT_TERMS.get(hints.intent, ())
     if not terms and hints.intent != 'definition':
@@ -179,6 +178,10 @@ def _log_result(question: str, answer: str, results: list[dict], top_score: floa
 
 
 def _trend_category_hint(analysis: QueryAnalysis) -> str | None:
+    if analysis.target_type == 'idol_or_group':
+        return 'idol'
+    if analysis.target_type == 'actor':
+        return 'actor'
     question = analysis.original_question.casefold()
     if any(term in question for term in ('아이돌', '걸그룹', '보이그룹', '그룹')):
         return 'idol'
@@ -187,84 +190,114 @@ def _trend_category_hint(analysis: QueryAnalysis) -> str | None:
     return None
 
 
-def _trend_articles(items: list[trend_service.TrendItem]) -> list[dict]:
-    articles = []
-    for item in items:
-        representative = item.articles[0] if item.articles else {}
-        article = dict(representative)
-        article['title'] = representative.get('title') or item.name
-        article['content'] = (f'집계 대상: {item.name}. '
-                              f'최근 수집 기사 {item.mention_count}건, '
-                              f'언론사 {item.source_count}곳, '
-                              f'최신 기사 {item.latest_at.isoformat() if item.latest_at else "미상"}.')
-        article['summary'] = None
-        article['url'] = representative.get('url') or f'trend://{item.name}'
-        article['collected_at'] = representative.get('collected_at')
-        article['similarity'] = item.score
-        articles.append(article)
-    return articles
-
-
 def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResponse:
+    started = time.perf_counter()
     now = datetime.now().astimezone()
     items, scanned = trend_service.aggregate(
-        analysis.time_range,
-        top_k=min(top_k, config.TREND_TOP_K),
-        category_hint=_trend_category_hint(analysis),
-        now=now,
+        analysis.time_range, top_k=min(top_k, config.TREND_TOP_K),
+        category_hint=_trend_category_hint(analysis), now=now,
     )
+    diagnostics.record(articles_scanned=scanned, top_entities=[
+        {'name': item.name, 'mention_count': item.mention_count,
+         'source_count': item.source_count, 'score': round(item.score, 4)} for item in items])
     if not items:
         answer = INSUFFICIENT_ANSWER
-        _log_result(question, answer, [], None, False, 0)
+        trace = diagnostics.snapshot()
+        reason = ('no_articles' if not scanned else 'no_entity_candidates'
+                  if not trace.get('raw_entities') else 'no_eligible_entities_after_fallback')
+        diagnostics.finish(generated_answer='', validated_answer='', final_answer=answer,
+                           insufficient_reason=reason)
+        _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
         return AskResponse(answer=answer, sources=[], domain='ent_culture')
-    results = _trend_articles(items)
-    context = '\n'.join(
-        f'[{index}] {item.name}: 기사 {item.mention_count}건, 언론사 {item.source_count}곳, '
-        f'최신일 {item.latest_at.date().isoformat() if item.latest_at else "미상"}'
-        for index, item in enumerate(items, start=1)
-    )
+
+    start = trend_service.period_start(analysis.time_range, now)
+    scope = (f'현재 순위는 {start.date().isoformat()}부터 {now.date().isoformat()}까지 발행된 '
+             f'현재 DB 수집 기사 중 최신 {scanned}건을 조회한 결과이며, '
+             '기사 언급량, 출처 다양성, 최근성을 반영한 순위입니다. '
+             '전체 대중 인기도나 긍정적인 활동량 순위는 아닙니다.')
+    if diagnostics.snapshot().get('entity_extraction_failures'):
+        scope += ' 일부 기사 묶음의 인물 분석이 완료되지 않아 확인된 후보만 포함한 부분 집계입니다.'
+    results, evidence, fallback, manifest = [], [], [], []
+    for item in items:
+        representative = item.articles[0] if item.articles else {}
+        index = len(results) + 1
+        manifest.append({'name': item.name, 'mention_count': item.mention_count,
+                         'source_count': item.source_count, 'evidence_ids': [index]})
+        metric = (f'현재 수집된 기사 기준 상위 집계 대상은 {item.name}입니다. '
+                  f'{item.name}의 기사 언급량은 {item.mention_count}건, 서로 다른 출처 수는 URL 도메인 기준 {item.source_count}곳입니다.')
+        article = dict(representative)
+        article.setdefault('title', item.name)
+        article.setdefault('url', '')
+        article.setdefault('collected_at', None)
+        article['similarity'] = item.score
+        results.append(article)
+        body = (representative.get('summary') or representative.get('content') or '')[:MAX_CONTEXT_CHARS]
+        evidence.append(metric + '\n' + scope + '\n' + article['title'] + '\n' + body)
+        # This path is a deterministic extract of real aggregate facts and titles.
+        fallback.extend(unit + f'[{index}]' for unit in sentences(metric))
+        if representative.get('title'):
+            fallback.append(representative['title'] + f'[{index}]')
+        for other in item.articles[1:]:
+            if other.get('url') == representative.get('url'):
+                continue
+            results.append(dict(other, similarity=item.score))
+            manifest[-1]['evidence_ids'].append(len(results))
+            evidence.append((other.get('title') or '') + '\n' +
+                            (other.get('summary') or other.get('content') or '')[:MAX_CONTEXT_CHARS])
+    fallback.extend(unit + '[1]' for unit in sentences(scope))
+    intro = '현재 수집된 기사 기준으로는 ' + ', '.join(item.name for item in items) + ' 등이 상위 집계 대상입니다.'
+    evidence[0] = intro + '\n' + evidence[0]
+    context = ('RANKED_ENTITIES: ' + json.dumps(manifest, ensure_ascii=False) + '\n\n' +
+               '\n\n'.join(f'[{i}]\n{text}' for i, text in enumerate(evidence, 1)))
     try:
         draft = generate_trend_answer(question, context)
     except OpenAIServiceError:
-        draft = ('최근 수집 기사 기준으로는 ' + ', '.join(
-            f'{item.name}({item.mention_count}건)' for item in items
-        ) + '이(가) 많이 언급됐습니다.' + ''.join(
-            f'[{index}]' for index in range(1, len(items) + 1)
-        ))
-    evidence = [
-        f'최근 수집 기사 기준으로 {item.name}이(가) {item.mention_count}건으로 집계됐습니다. '
-        f'{item.name}: 기사 {item.mention_count}건, 언론사 {item.source_count}곳, '
-        f'최신일 {item.latest_at.date().isoformat() if item.latest_at else "미상"}\n{article["title"]}'
-        for item, article in zip(items, results)
-    ]
-    checked = validate_answer(draft, evidence)
+        draft = '\n'.join(fallback)
+    try:
+        reviewed = verify_answer(question, context, draft)
+        checked = validate_answer(reviewed, evidence, semantic_verified=True)
+    except OpenAIServiceError:
+        checked = validate_answer(draft, evidence, require_extract=True)
     if not checked.citation_ids:
-        fallback = '\n'.join(
-            f'최근 수집 기사 기준으로 {item.name}이(가) {item.mention_count}건으로 집계됐습니다.[{index}]'
-            for index, item in enumerate(items, start=1)
-        )
-        checked = validate_answer(fallback, evidence)
-    used = [results[index - 1] for index in checked.citation_ids]
-    answer = remap_citations(checked.answer, checked.citation_ids)
-    if os.getenv('RAG_DEBUG', '').casefold() == 'true':
-        logger.warning('[TREND] intent=%s time_range=%s period_days=%d articles_scanned=%d '
-                       'entities_found=%d eligible_entities=%d top_entities=%s',
-                       analysis.intent, analysis.time_range,
-                       trend_service.period_days(analysis.time_range), scanned,
-                       len(items), len(used),
-                       [(item.name, item.mention_count, item.source_count, round(item.score, 3))
-                        for item in items])
+        checked = validate_answer('\n'.join(fallback), evidence)
+    # Always retain the direct DB-backed conclusion and sampling scope. The
+    # semantic reviewer must not turn a ranked answer into orphaned details.
+    scope_units = sentences(scope)
+    details = [unit for unit in sentences(checked.answer) if checked.citation_ids
+               and CITATION.sub('', unit).strip() not in {*scope_units, intro}
+               and '상위 집계 대상' not in unit and not unit.startswith('현재 순위는')]
+    body = intro + '[1]\n' + '\n'.join(details)
+    body += '\n' + '\n'.join(unit + '[1]' for unit in scope_units)
+    checked = type(checked)(body, tuple(sorted(set(checked.citation_ids) | {1})),
+                            checked.removed_sentences, checked.reasons, checked.replaced_sentences)
+    used, source_numbers, mapping = [], {}, {}
+    for index in checked.citation_ids:
+        article = results[index - 1]
+        key = article.get('url') or ('article', index)
+        if key not in source_numbers:
+            used.append(article)
+            source_numbers[key] = len(used)
+        mapping[index] = source_numbers[key]
+    answer = CITATION.sub(lambda match: f'[{mapping[int(match.group(1))]}]', checked.answer)
+    diagnostics.finish(generated_answer=draft, validated_answer=checked.answer,
+                       final_answer=answer, validation_reasons=checked.reasons,
+                       insufficient_reason=None if used else 'no_supported_sentence_after_validation')
     _log_result(question, answer, used, used[0].get('similarity') if used else None,
-                bool(used), 0)
+                bool(used), int((time.perf_counter() - started) * 1000))
     return AskResponse(answer=answer, sources=[_source(article) for article in used], domain='ent_culture')
 
 
 def answer_question(question: str, top_k: int) -> AskResponse:
     started = time.perf_counter()
+    diagnostics.begin(question)
     analysis, llm_used = _query_analysis(question)
+    diagnostics.record(intent=analysis.intent, target_type=analysis.target_type,
+                       route='trend_service.aggregate' if analysis.intent == 'trend_ranking' else 'rag',
+                       query_analysis=analysis.__dict__, llm_used=llm_used)
     if analysis.intent == 'trend_ranking':
         return _answer_trend(question, analysis, top_k)
     results = _search(question, top_k, analysis)
+    diagnostics.record(retrieved_docs=len(results), final_docs=len(results))
     if not results:
         if os.getenv('RAG_DEBUG', '').casefold() == 'true':
             logger.warning('[RAG] question=%s intent=%s entity=%s candidate_docs=0 '
@@ -272,6 +305,8 @@ def answer_question(question: str, top_k: int) -> AskResponse:
                            'removed_sentences=0 insufficient_reason=no_retrieval_results',
                            question, analysis.intent, analysis.entity or '')
         answer = INSUFFICIENT_ANSWER
+        diagnostics.finish(generated_answer='', validated_answer='', final_answer=answer,
+                           insufficient_reason='no_retrieval_results')
         _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
         return AskResponse(answer=answer, sources=[], domain='ent_culture')
 
@@ -284,18 +319,26 @@ def answer_question(question: str, top_k: int) -> AskResponse:
     draft_check = validate_answer(draft, evidence)
     try:
         reviewed = verify_answer(question, context, draft)
+        semantic_verified = True
     except OpenAIServiceError:
         # The local validator still protects the draft when semantic review fails.
         reviewed = INSUFFICIENT_ANSWER
+        semantic_verified = False
         logger.warning('Answer verification failed; using locally validated draft where possible.')
-    checked = validate_answer(reviewed, evidence)
+    checked = validate_answer(reviewed, evidence, semantic_verified=semantic_verified)
     if (not checked.citation_ids and draft_check.citation_ids
             and _has_related_evidence(question, results, analysis)):
-        checked = draft_check
+        # Recover only verbatim source claims; lexical overlap alone cannot
+        # override a semantic rejection (e.g. swapped subject and action).
+        checked = validate_answer(draft, evidence, require_extract=True)
         logger.info('Verifier removed all claims; restored locally grounded draft sentences.')
     checked = _title_fallback(question, reviewed, results, checked, analysis)
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
+    diagnostics.finish(generated_answer=draft, validated_answer=checked.answer,
+                       final_answer=answer, cited_docs=len(used_results),
+                       validation_reasons=checked.reasons,
+                       insufficient_reason=None if used_results else 'no_supported_sentence_after_validation')
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
         logger.warning('[QUERY] original=%s rule_intent=%s llm_used=%s entity=%s '
                        'intent=%s time_range=%s confidence=%.2f normalized=%s keywords=%s search_queries=%s',

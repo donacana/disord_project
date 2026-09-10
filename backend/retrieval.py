@@ -9,11 +9,12 @@ from collections import Counter
 from datetime import date, datetime, timezone
 
 if __package__:
-    from . import config, db
+    from . import config, db, diagnostics
     from .query_utils import ARTICLE_INTENT_TERMS, QueryAnalysis, QueryHints, analysis_to_hints, analyze_query
 else:
     import config
     import db
+    import diagnostics
     from query_utils import ARTICLE_INTENT_TERMS, QueryAnalysis, QueryHints, analysis_to_hints, analyze_query
 
 MIN_SIMILARITY = config.MIN_SIMILARITY
@@ -247,6 +248,7 @@ def search(embedding: list[float], question: str, top_k: int,
                           max(config.CANDIDATE_TOP_K, top_k * config.CANDIDATE_MULTIPLIER))
     rows = db.fetch_all(SEARCH_QUERY, (vector, vector, candidate_count))
     ranked = rank_candidates(rows, question, top_k, min_similarity, analysis=analysis)
+    diagnostics.record(candidate_docs=len(rows), final_docs=len(ranked))
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
         logger.warning('[RAG] question=%s vector_candidates=%d after_rerank=%d final_docs=%d',
                        question, len(rows), len(ranked), len(ranked))

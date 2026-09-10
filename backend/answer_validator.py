@@ -19,7 +19,6 @@ PARTICLES = ('으로부터', '에서는', '에게는', '으로는', '에서', '�
 PREDICATE_ENDINGS = ('하였습니다', '되었습니다', '했습니다', '됐습니다', '합니다',
                      '됩니다', '되었다', '됐다고', '이라고', '입니다', '습니다',
                      '했다', '한다', '이며', '이고', '발매했다', '컴백했다')
-MAX_VERIFIED_SENTENCES = 3
 MAX_EVIDENCE_SENTENCE_CHARS = 600
 # Grammatical/reporting expressions, not artist/work/brand names.
 FUNCTION_WORDS = {
@@ -94,8 +93,10 @@ def _lexical_tokens(claim: str, evidence: str) -> list[str]:
     return tokens
 
 
-def _supported(claim: str, evidence: str) -> bool:
+def _supported(claim: str, evidence: str, *, semantic_verified: bool = False) -> bool:
     evidence = _normalize(evidence)
+    evidence += ' ' + ' '.join(f'{int(year)}년 {int(month)}월 {int(day)}일'
+                              for year, month, day in re.findall(r'\b(\d{4})-(\d{2})-(\d{2})\b', evidence))
     compact = re.sub(r'\s+', '', evidence)
     # A number with its unit must occur together, not just elsewhere as a year
     # or a count. Numeric boundaries prevent 1 from matching 11.
@@ -108,6 +109,10 @@ def _supported(claim: str, evidence: str) -> bool:
         name = match.group(1) or match.group(2)
         if re.sub(r'\s+', '', _normalize(name)) not in compact:
             return False
+    if semantic_verified:
+        # Semantic review checks subject/action, negation, names and synthesis.
+        # Token identity would reject legitimate Korean paraphrases afterwards.
+        return bool(claim.strip())
     tokens = _lexical_tokens(claim, evidence)
     # Require every remaining specific token, not an overlap average that could
     # hide an invented album name in a mostly accurate sentence.
@@ -137,12 +142,19 @@ def _grounded_extract(claim: str, cited_evidence: list[str]) -> str | None:
     return min(candidates, key=len) if candidates else None
 
 
-def validate_answer(answer: str, evidence: list[str], *, require_extract: bool = False) -> ValidationResult:
+def validate_answer(answer: str, evidence: list[str], *, require_extract: bool = False,
+                    semantic_verified: bool = False) -> ValidationResult:
     answer = unicodedata.normalize('NFKC', answer).strip()
     units = sentences(answer)
     kept, removed, reasons, replaced = [], [], [], []
     used = set()
+    pending_heading = None
     for unit in units:
+        if re.fullmatch(r'\*\*[^*\n]+\*\*', unit):
+            label = unit.strip('*')
+            if label in {'요약', '주요 포인트', '주요 인물/그룹', '핵심 활동', '최근 흐름', '종합'} or any(label in source for source in evidence):
+                pending_heading = unit
+                continue
         if CITATION.sub('', unit).strip() in GLOBAL_ABSTENT:
             if len(units) == 1:
                 return ValidationResult(INSUFFICIENT_ANSWER, (), (), ('global_insufficiency',))
@@ -160,9 +172,12 @@ def validate_answer(answer: str, evidence: list[str], *, require_extract: bool =
             reason = 'invalid_or_missing_citation'
         else:
             claim = CITATION.sub('', unit).strip()
-            # Each cited article must support the sentence. This deliberately
-            # rejects multi-claim sentences spread across unrelated sources.
-            if not all(_supported(claim, evidence[number - 1]) for number in ids):
+            # Only a successful semantic review may admit multi-source synthesis.
+            if semantic_verified and not require_extract:
+                supported = _supported(claim, '\n'.join(evidence[number - 1] for number in ids), semantic_verified=True)
+            else:
+                supported = all(_supported(claim, evidence[number - 1]) for number in ids)
+            if not supported:
                 reason = 'unsupported_specific_tokens'
             elif require_extract and not all(_is_extract(claim, evidence[number - 1]) for number in ids):
                 original = _grounded_extract(claim, [evidence[number - 1] for number in ids])
@@ -176,10 +191,13 @@ def validate_answer(answer: str, evidence: list[str], *, require_extract: bool =
             removed.append(unit)
             reasons.append(reason)
         else:
-            if require_extract and (unit in kept or len(kept) >= MAX_VERIFIED_SENTENCES):
+            if require_extract and unit in kept:
                 removed.append(unit)
-                reasons.append('duplicate_or_sentence_limit')
+                reasons.append('duplicate_sentence')
                 continue
+            if pending_heading:
+                kept.append(pending_heading)
+                pending_heading = None
             kept.append(unit)
             used.update(ids)
     return ValidationResult('\n'.join(kept) if kept else INSUFFICIENT_ANSWER,

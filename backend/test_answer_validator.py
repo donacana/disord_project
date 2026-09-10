@@ -11,6 +11,9 @@ from backend.answer_validator import INSUFFICIENT_ANSWER, remap_citations, sente
 
 EVIDENCE = '테스트그룹은 게임 컬래버를 진행했습니다. 테스트그룹 게임 컬래버 진행. 게임 브랜드와 협업.'
 SUPPORTED = '테스트그룹은 게임 컬래버를 진행했습니다.[1]'
+VERIFIED_JSON = json.dumps({'sentences': [
+    {'text': '테스트그룹은 게임 컬래버를 진행했습니다.', 'citations': [1], 'section': ''},
+]}, ensure_ascii=False)
 
 
 def article(identifier, content=EVIDENCE, summary=None):
@@ -121,6 +124,11 @@ class ValidatorTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(rag, '_query_analysis', side_effect=lambda q: (rag.rule_query_analysis(q), False))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_used_sources_and_log_are_compacted(self):
         rows = [article(1, '다른그룹 광고'), article(2)]
         supported_second = SUPPORTED.replace('[1]', '[2]')
@@ -182,8 +190,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_same_chat_model_and_one_verification_request(self):
         client = Mock()
-        client.chat.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=SUPPORTED))])
+        client.chat.completions.create.side_effect = [SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+            for text in (SUPPORTED, VERIFIED_JSON)]
         with patch.dict('os.environ', {'OPENAI_CHAT_MODEL': 'configured-model'}), \
                 patch.object(openai_client, '_client', return_value=client):
             openai_client.generate_answer('활동', EVIDENCE)
@@ -194,16 +203,36 @@ class PipelineTests(unittest.TestCase):
 
     def test_answer_prompts_allow_grounded_detail(self):
         client = Mock()
-        client.chat.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=SUPPORTED))])
+        client.chat.completions.create.side_effect = [SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+            for text in (SUPPORTED, VERIFIED_JSON)]
         with patch.object(openai_client, '_client', return_value=client):
             openai_client.generate_answer('테스트그룹 최근 활동', EVIDENCE)
             openai_client.verify_answer('테스트그룹 최근 활동', EVIDENCE, SUPPORTED)
         generation_prompt = client.chat.completions.create.call_args_list[0].kwargs['messages'][0]['content']
         verification_prompt = client.chat.completions.create.call_args_list[1].kwargs['messages'][0]['content']
-        self.assertIn('최대 6개의 짧은 문장', generation_prompt)
+        self.assertIn('4~6문장', generation_prompt)
         self.assertIn('기사 제목을 그대로 반복하지 말고', generation_prompt)
-        self.assertIn('최대 6개까지 유지하라', verification_prompt)
+        self.assertIn('근거 문장을 모두 유지하라', verification_prompt)
+
+    def test_semantically_verified_synthesis_keeps_multiple_sources(self):
+        evidence = ['테스트그룹은 새 앨범을 발매했다.', '테스트그룹은 일본 공연을 진행했다.']
+        answer = '테스트그룹은 새 앨범 발매와 일본 공연을 이어가고 있습니다.[1][2]'
+        self.assertEqual(validate_answer(answer, evidence).citation_ids, ())
+        checked = validate_answer(answer, evidence, semantic_verified=True)
+        self.assertEqual(checked.answer, answer)
+        self.assertEqual(checked.citation_ids, (1, 2))
+        self.assertFalse(validate_answer(answer.replace('일본 공연', '일본 100회 공연'), evidence,
+                                         semantic_verified=True).citation_ids)
+
+    def test_semantic_rejection_does_not_restore_role_reversal(self):
+        rows = [article(1, '소속사는 테스트그룹을 보호했다. 테스트그룹은 소속사와 활동했다.')]
+        with patch.object(rag, '_search', return_value=rows), \
+                patch.object(rag, 'generate_answer', return_value='테스트그룹은 소속사를 보호했다.[1]'), \
+                patch.object(rag, 'verify_answer', return_value=INSUFFICIENT_ANSWER), \
+                patch.object(db, 'execute'):
+            result = rag.answer_question('테스트그룹 최근 활동', 5)
+        self.assertNotIn('테스트그룹은 소속사를 보호했다.', result.answer)
 
     def test_multiple_grounded_sentences_survive(self):
         evidence = [
@@ -219,6 +248,20 @@ class PipelineTests(unittest.TestCase):
         unsupported = validate_answer(answer + '\n테스트그룹은 세계 최고입니다.[1]', evidence)
         self.assertEqual(len(unsupported.answer.splitlines()), 3)
         self.assertTrue(unsupported.removed_sentences)
+
+    def test_structured_review_attaches_citations_to_every_sentence(self):
+        client = Mock()
+        payload = {'sentences': [
+            {'text': '테스트그룹은 게임 컬래버를 진행했습니다. 게임 브랜드와 협업했습니다.',
+             'section': '핵심 활동', 'citations': [1]},
+        ]}
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))])
+        with patch.object(openai_client, '_client', return_value=client):
+            reviewed = openai_client.verify_answer('활동', EVIDENCE, SUPPORTED)
+        checked = validate_answer(reviewed, [EVIDENCE], semantic_verified=True)
+        self.assertEqual(checked.answer.count('[1]'), 2)
+        self.assertIn('**핵심 활동**', checked.answer)
 
     def test_generation_failure_keeps_503_contract(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
@@ -239,7 +282,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn('20일', result.answer)
         insufficient = validate_answer(INSUFFICIENT_ANSWER, rag._evidence([row]), require_extract=True)
         self.assertEqual(rag._title_fallback('최근 영화 개봉작 알려줘', INSUFFICIENT_ANSWER,
-                                            [row], insufficient).answer, INSUFFICIENT_ANSWER)
+                                            [row], insufficient).answer, row['title'] + '[1]')
         row['title'] = '테스트그룹 게임 컬래버'
         reviewed = '테스트그룹은 공연이 활발합니다.[1]'
         checked = validate_answer(reviewed, rag._evidence([row]), require_extract=True)
