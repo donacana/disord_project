@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -21,17 +22,23 @@ def analyze_question(question: str) -> dict:
         '질문에 직접 답하지 말고, 사실·숫자·프로필을 만들지 마라.\n'
         'original_question, normalized_question, entity, intent, time_range, keywords, '
         'search_queries, target_type, confidence만 JSON으로 반환하라.\n'
-        '대상 집단에서 누가 유명한지, 화제인지, 최근 활동이나 언급이 많은지 묻는 질문은 '
-        '반드시 trend_ranking이다. 일반적인 업계 이슈/유행 설명은 general 또는 trend이다.\n'
+        '대상 집단에서 누가 유명한지, 화제인지, 최근 활동이나 언급이 많은지 순위를 묻는 질문은 '
+        'trend_ranking이다. 특정 entity가 있고 왜 유명해졌는지, 왜 화제가 되었는지, 왜 많이 언급되는지 '
+        '원인을 묻는 질문은 popularity_reason이며 trend_ranking보다 우선한다. 단순히 유명/화제라는 단어가 '
+        '있다는 이유만으로 순위 질문으로 분류하지 마라.\n'
         '요즘 어떤 아이돌이 유명해?, 요즘 누가 유명해?, 최근 활동이 많은 아이돌 알려줘, '
         '최근 화제인 배우 알려줘는 모두 entity=null, intent=trend_ranking, time_range=recent이다.\n'
         'target_type은 idol_or_group, actor, entertainer, work, general 중 하나다. '
         '아이돌 질문은 idol_or_group, 배우 질문은 actor, 누가 유명해는 entertainer이다. '
         '스키즈 요즘 뭐함?은 entity=스트레이 키즈, intent=activity이다. '
         '특정 인물의 활동 질문을 집단 순위로 바꾸지 마라.\n'
+        '왜 요즘 디원이 유명해졌어?, 장원영은 왜 요즘 화제야?, 스트레이 키즈는 왜 최근 많이 언급돼?는 '
+        'entity를 각각 보존하고 intent=popularity_reason, time_range=recent으로 분류하라. '
+        'popularity_reason의 search_queries는 entity 최근 활동/이슈/화제/근황/기사/인터뷰처럼 실제 원인을 '
+        '찾는 검색어를 사용하고 유명한 이유 자체를 검색어로 만들지 마라.\n'
         'entity는 질문에 있거나 명확한 별칭으로 확인되는 대상만 추출하고 확신이 없으면 null로 둬라.\n'
         'intent는 definition, activity, controversy, comeback, movie, drama, show, event, trend, '
-        'trend_ranking, general 중 하나만 사용하라. time_range는 recent, today, week, month, year, '
+        'trend_ranking, popularity_reason, general 중 하나만 사용하라. time_range는 recent, today, week, month, year, '
         'all, unknown 중 하나만 사용하라. search_queries는 중복 없이 1~6개로 제한하되 trend_ranking은 빈 배열을 허용한다.\n'
         '스키즈는 스트레이 키즈, 방탄은 BTS, 블핑은 BLACKPINK로 정규화할 수 있다.\n'
         'confidence는 질문 해석의 확신도일 뿐 답변 사실의 근거가 아니다.'
@@ -47,6 +54,7 @@ def analyze_question(question: str) -> dict:
             'intent': {'type': 'string', 'enum': [
                 'definition', 'activity', 'controversy', 'comeback', 'movie', 'drama',
                 'show', 'event', 'trend', 'trend_ranking', 'general',
+                'popularity_reason',
             ]},
             'time_range': {'type': 'string', 'enum': [
                 'today', 'week', 'recent', 'month', 'year', 'all', 'unknown',
@@ -98,7 +106,13 @@ def _client() -> OpenAI:
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
     if not api_key:
         raise OpenAIServiceError('OPENAI_API_KEY 환경변수가 설정되지 않았습니다.')
-    return OpenAI(api_key=api_key)
+    return _pooled_client(api_key, os.getenv('OPENAI_BASE_URL') or None)
+
+
+@lru_cache(maxsize=4)
+def _pooled_client(api_key: str, base_url: str | None) -> OpenAI:
+    # Reuse the HTTP connection pool across analysis, extraction and validation.
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def extract_trend_entities(context: str) -> list[dict]:
@@ -228,6 +242,10 @@ def generate_answer(question: str, context: str) -> str:
         '"현재 수집된 자료만으로는 확인하기 어렵습니다."라고 답한다.\n'
         '질문의 일부만 확인되어도 확인 가능한 사실을 먼저 답하고, 확인되지 않은 부분만 생략한다.\n'
         '인기, 대세, 뜨거운 반응, 성공, 영향력 같은 평가는 기사에 명시된 경우에만 사용한다.\n'
+        '특정 entity가 왜 유명해졌는지/화제가 되었는지를 묻는 원인형 질문에서는 popularity 자체를 단정하지 말고, '
+        '최근 기사에서 확인되는 사건·활동·성과를 이유 후보로 통합해 설명한다. 기사 언급 증가와 실제 대중 인기도 상승을 '
+        '동일시하지 말고, 필요하면 "최근 보도에서 주목받은 배경" 또는 "현재 수집 기사 기준"으로 표현한다. '
+        '질문에 없는 다른 인물의 순위나 trend_ranking 집계를 덧붙이지 않는다.\n'
         '게임 컬래버 등의 소식만으로 컴백이나 공연이 활발하다고 판단하지 않는다.\n'
         '사건/논란 기사를 활동 이력으로 포장하지 않는다. 발행일을 사건이나 활동 날짜로 바꾸지 않는다.\n'
         '답변과 근거가 충돌하면 근거를 우선하고 답변 뒤에 서로 모순되는 결론을 추가하지 않는다.\n'

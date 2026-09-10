@@ -253,3 +253,26 @@ def search(embedding: list[float], question: str, top_k: int,
         logger.warning('[RAG] question=%s vector_candidates=%d after_rerank=%d final_docs=%d',
                        question, len(rows), len(ranked), len(ranked))
     return ranked
+
+
+def search_suggestions(embedding: list[float], question: str, top_k: int,
+                       analysis: QueryAnalysis | None = None) -> list[dict]:
+    """Return low-threshold rows for exploratory suggestions only.
+
+    These rows must never become answer evidence; they only help the user
+    refine a failed query.
+    """
+    vector = '[' + ','.join(str(value) for value in embedding) + ']'
+    candidate_count = min(config.MAX_CANDIDATES,
+                          max(config.CANDIDATE_TOP_K, top_k * config.CANDIDATE_MULTIPLIER))
+    rows = db.fetch_all(SEARCH_QUERY, (vector, vector, candidate_count))
+    hints = analysis_to_hints(analysis) if analysis else analyze_query(question)
+    now = datetime.now(timezone.utc)
+    scored = []
+    for original in rows:
+        row = score_candidate(original, hints, now)
+        if row is None or row['similarity'] < config.SUGGESTION_THRESHOLD:
+            continue
+        if row['entity_score'] or row['keyword_score'] or row['title_score']:
+            scored.append(row)
+    return sorted(scored, key=lambda row: (-row['final_score'], -row['similarity']))[:top_k]

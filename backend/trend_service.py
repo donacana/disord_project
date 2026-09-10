@@ -5,22 +5,24 @@ import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import lru_cache
+from threading import Lock
 from urllib.parse import urlsplit
 from datetime import date, datetime, timedelta, timezone
 
 if __package__:
-    from . import config, db, diagnostics
+    from . import config, db, diagnostics, entity_cache
     from .openai_client import OpenAIServiceError, extract_trend_entities
     from .query_utils import ENTITY_ALIASES
 else:
     import config
     import db
     import diagnostics
+    import entity_cache
     from openai_client import OpenAIServiceError, extract_trend_entities
     from query_utils import ENTITY_ALIASES
 
 logger = logging.getLogger(__name__)
+_extraction_lock = Lock()
 
 TREND_ARTICLES_QUERY = """
 SELECT id AS article_id, title, content, category, source_name, url,
@@ -116,7 +118,6 @@ def _passage(row: dict) -> str:
     return (row.get('title') or '') + '\n' + (' '.join(roles[:3]) + '\n' + body[:200])[:600]
 
 
-@lru_cache(maxsize=32)
 def _extract_batch(passages: tuple[str, ...]) -> tuple[tuple[str, str, int], ...]:
     context = '\n\n'.join(f'ARTICLE {i}\n{text}' for i, text in enumerate(passages))
     found = []
@@ -162,24 +163,40 @@ def _has_name(text: str, name: str) -> bool:
                          + r'(?=$|[^가-힣A-Za-z0-9]|은|는|이|가|을|를|의|와|과|도)', text, re.IGNORECASE))
 
 
-def _entity_rows(rows: list[dict], category_hint: str | None) -> list[dict]:
-    passages = [_passage(row) for row in rows]
-    batches = [tuple(passages[i:i + config.TREND_ENTITY_BATCH_SIZE])
-               for i in range(0, len(passages), config.TREND_ENTITY_BATCH_SIZE)]
-    mentions = [[] for _ in rows]
+def _article_mentions(passages: list[str]) -> list[list[tuple[str, str]]]:
+    """Call only while holding the extraction lock to coalesce concurrent misses."""
+    keys = [entity_cache.key(passage) for passage in passages]
+    cached = entity_cache.get_many(keys)
+    missing = dict((key, passage) for key, passage in zip(keys, passages) if key not in cached)
+    missing_keys = list(missing)
+    batches = [missing_keys[i:i + config.TREND_ENTITY_BATCH_SIZE]
+               for i in range(0, len(missing_keys), config.TREND_ENTITY_BATCH_SIZE)]
+    diagnostics.record(entity_cache_hits=sum(key in cached for key in keys),
+                       entity_cache_misses=len(missing), entity_llm_batches=len(batches))
     failures = 0
     with ThreadPoolExecutor(max_workers=config.TREND_ENTITY_WORKERS) as pool:
-        futures = [pool.submit(_extract_batch, batch) for batch in batches]
-        offset = 0
+        futures = [pool.submit(_extract_batch, tuple(missing[key] for key in batch)) for batch in batches]
         for batch, future in zip(batches, futures):
+            extracted = {key: ([], True) for key in batch}
             try:
                 for name, kind, index in future.result():
-                    mentions[offset + index].append((name, kind))
+                    extracted[batch[index]][0].append((name, kind))
             except OpenAIServiceError:
                 failures += 1
-                for index, passage in enumerate(batch):
-                    mentions[offset + index].extend(_explicit_entities([passage]))
-            offset += len(batch)
+                extracted = {key: (_explicit_entities([missing[key]]), False) for key in batch}
+            # Store each completed batch immediately; a later failure or process
+            # restart must not discard all of the successful article analyses.
+            entity_cache.put_many(extracted)
+            cached.update(extracted)
+    diagnostics.record(entity_extraction_failures=failures,
+                       entity_extraction_incomplete_articles=sum(not cached[key][1] for key in keys))
+    return [list(cached[key][0]) for key in keys]
+
+
+def _entity_rows(rows: list[dict], category_hint: str | None) -> list[dict]:
+    passages = [_passage(row) for row in rows]
+    with _extraction_lock:
+        mentions = _article_mentions(passages)
     catalog = [item for article_mentions in mentions for item in article_mentions]
     desired = {'idol': 'idol_or_group', 'actor': 'actor'}.get(category_hint)
     eligible = {(name, kind) for name, kind in catalog if not desired or kind == desired}
@@ -189,8 +206,7 @@ def _entity_rows(rows: list[dict], category_hint: str | None) -> list[dict]:
         catalog = [item for article_mentions in mentions for item in article_mentions]
         eligible = {(name, kind) for name, kind in catalog if not desired or kind == desired}
     diagnostics.record(raw_entities=len({name for name, _ in catalog}),
-                       eligible_entities=len({name for name, _ in eligible}),
-                       entity_extraction_failures=failures)
+                       eligible_entities=len({name for name, _ in eligible}))
     eligible_names = {ENTITY_ALIASES.get(name.casefold(), name) for name, _ in eligible}
     output = []
     for row, article_mentions in zip(rows, mentions):

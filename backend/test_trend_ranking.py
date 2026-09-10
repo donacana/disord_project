@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -24,6 +26,13 @@ def row(identifier, title, source, days=1, category='music', duplicate=None):
 
 
 class TrendRankingTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        cache = patch.object(trend_service.config, 'TREND_ENTITY_CACHE_PATH', str(Path(directory.name) / 'entities.sqlite3'))
+        cache.start()
+        self.addCleanup(cache.stop)
+
     def test_trend_intents(self):
         for question in [
             '요즘 누가 유명해?',
@@ -79,6 +88,22 @@ class TrendRankingTests(unittest.TestCase):
         self.assertEqual(len(result.sources), 1)
         self.assertIn('A그룹', result.answer)
 
+    def test_popularity_reason_uses_normal_rag_without_trend_aggregation(self):
+        analysis = rule_query_analysis('왜 요즘 디원이 유명해졌어?')
+        article = row(1, '디원 군악대 합격과 입대 예정', 'A')
+        article['content'] = '디원이 군악대 최종 합격 소식과 입대 예정 소식으로 최근 보도됐다.'
+        article['summary'] = article['content']
+        article['similarity'] = 0.9
+        with patch.object(rag, '_query_analysis', return_value=(analysis, False)), \
+                patch.object(rag.trend_service, 'aggregate') as aggregate, \
+                patch.object(rag, '_search', return_value=[article]), \
+                patch.object(rag, 'generate_answer', return_value='최근 군악대 합격 소식이 보도됐습니다.[1]'), \
+                patch.object(rag, 'verify_answer', return_value='최근 군악대 합격 소식이 보도됐습니다.[1]'), \
+                patch.object(db, 'execute'):
+            result = rag.answer_question(analysis.original_question, 5)
+        aggregate.assert_not_called()
+        self.assertIn('군악대', result.answer)
+
     def test_single_candidate_survives_generation_and_verification_insufficiency(self):
         items = [trend_service.TrendItem('A그룹', 1, 1, NOW, .9, (row(1, 'A그룹 컴백', 'A'),))]
         analysis = rule_query_analysis('요즘 어떤 아이돌이 유명해?')
@@ -95,7 +120,6 @@ class TrendRankingTests(unittest.TestCase):
         self.assertIsNone(diagnostics.snapshot()['insufficient_reason'])
 
     def test_extraction_requires_real_name_and_quote(self):
-        trend_service._extract_batch.cache_clear()
         passage = '그룹 스트레이 키즈가 신곡을 공개했다.'
         payload = [
             dict(name='스트레이 키즈', target_type='idol_or_group', article_index=0, evidence_quote=passage),
@@ -104,7 +128,6 @@ class TrendRankingTests(unittest.TestCase):
         ]
         with patch.object(trend_service, 'extract_trend_entities', return_value=payload):
             self.assertEqual(trend_service._extract_batch((passage,)), (('스트레이 키즈', 'idol_or_group', 0),))
-        trend_service._extract_batch.cache_clear()
 
     def test_type_filter_full_names_and_source_counts(self):
         rows = [row(1, '스트레이 키즈, 신곡 공개', 'A'), row(2, '스트레이 키즈의 공연', None),

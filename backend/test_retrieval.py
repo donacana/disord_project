@@ -46,6 +46,13 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual([r['article_id'] for r in result], [1])
         self.assertEqual(retrieval.rank_candidates(rows, '아이브', 5, .9), [])
 
+    def test_suggestion_candidates_use_separate_threshold(self):
+        rows = [article(1, '김가람 최근 활동', .21), article(2, '완전히 무관한 뉴스', .19)]
+        with patch.object(db, 'fetch_all', return_value=rows):
+            result = retrieval.search_suggestions([0.1], '르세라핌 출신 김가람은 요즘 뭐해?', 3,
+                                                  rule_query_analysis('르세라핌 출신 김가람은 요즘 뭐해?'))
+        self.assertEqual([row['article_id'] for row in result], [1])
+
     def test_recency_and_no_keyword_fallback(self):
         for days, expected in [(0, 1), (7, 1), (8, .7), (30, .7), (31, .3), (90, .3), (91, 0)]:
             self.assertEqual(retrieval.recency_score(NOW - timedelta(days=days), NOW), expected)
@@ -133,6 +140,33 @@ class RetrievalTests(unittest.TestCase):
         rule = rule_query_analysis('장원영 최근 활동 알려줘')
         invalid = merge_llm_analysis(rule, {'intent': 'made_up_intent'})
         self.assertEqual(invalid.intent, 'general')
+
+    def test_popularity_reason_is_entity_specific_and_ranking_stays_aggregate(self):
+        popularity_questions = [
+            '왜 요즘 디원이 유명해졌어?',
+            '디원이 왜 화제야?',
+            '장원영은 왜 요즘 많이 언급돼?',
+            '스트레이 키즈는 왜 뜬 거야?',
+        ]
+        for question in popularity_questions:
+            analysis = rule_query_analysis(question)
+            self.assertEqual(analysis.intent, 'popularity_reason', question)
+            self.assertIsNotNone(analysis.entity, question)
+            self.assertEqual(analysis.time_range, 'recent', question)
+            self.assertNotIn('유명한 이유', ' '.join(analysis.search_queries), question)
+
+        for question in ('요즘 누가 유명해?', '최근 많이 언급된 아이돌 누구야?'):
+            analysis = rule_query_analysis(question)
+            self.assertEqual((analysis.entity, analysis.intent), (None, 'trend_ranking'), question)
+
+    def test_popularity_reason_overrides_conflicting_llm_intent(self):
+        rule = rule_query_analysis('왜 요즘 디원이 유명해졌어?')
+        merged = merge_llm_analysis(rule, {
+            'entity': None, 'intent': 'trend_ranking', 'time_range': 'recent',
+            'keywords': ['디원', '유명'], 'search_queries': [],
+            'normalized_question': '최근 화제 인물', 'confidence': 0.95,
+        })
+        self.assertEqual((merged.entity, merged.intent), ('디원', 'popularity_reason'))
 
     def test_llm_query_analysis_json_and_failure(self):
         response = type('Response', (), {'choices': [type('Choice', (), {

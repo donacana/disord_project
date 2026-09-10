@@ -11,7 +11,7 @@ else:
 RECENCY_TERMS = ('최근', '요즘', '현재', '근황', '최신', '이번주', '이번달')
 ALLOWED_INTENTS = frozenset({
     'definition', 'activity', 'controversy', 'comeback', 'movie', 'drama',
-    'show', 'event', 'trend', 'trend_ranking', 'general',
+    'show', 'event', 'trend', 'trend_ranking', 'popularity_reason', 'general',
 })
 ALLOWED_TIME_RANGES = frozenset({'recent', 'today', 'week', 'month', 'year', 'all', 'unknown'})
 ENTITY_ALIASES = {
@@ -51,6 +51,8 @@ INTENT_TERMS = {
     'activity': ('활동', '근황', '출연', '뭐함', '뭐해', '뭐하고'),
     'comeback': ('컴백', '앨범', '신곡', '음반', '발매'),
     'trend_ranking': ('누가 유명', '누가 핫', '많이 언급', '뜨는 아이돌', '화제 인물'),
+    'popularity_reason': ('유명해졌', '유명해짐', '뜬 거야', '화제야', '많이 언급돼',
+                          '자주 나와', '주목받', '핫해졌', '인기가 많아졌'),
 }
 ARTICLE_INTENT_TERMS = {
     **INTENT_TERMS,
@@ -110,6 +112,32 @@ def is_ranking_question(question: str) -> bool:
     population = any(term in compact for term in ('누가', '누구', '어떤아이돌', '아이돌', '배우', '그룹', '연예인', '화제인물'))
     ranking = any(term in compact for term in ('유명', '핫', '뜨는', '화제', '많이언급', '활동이많', '활동많'))
     return population and ranking
+
+
+def is_popularity_reason_question(question: str) -> bool:
+    compact = re.sub(r'\s+', '', question.casefold())
+    explicit_reason_terms = (
+        '왜유명해', '유명해졌', '유명해짐', '왜뜬', '뜬거야',
+        '인기가많아졌', '왜핫해졌', '유명한이유', '화제가된이유',
+    )
+    contextual_reason_terms = ('화제야', '많이언급돼', '많이언급되', '왜자주나와', '주목받')
+    has_reason_marker = '왜' in compact or '이유' in compact
+    return (any(term in compact for term in explicit_reason_terms)
+            or (has_reason_marker and any(term in compact for term in contextual_reason_terms)))
+
+
+def extract_popularity_entity(question: str) -> str | None:
+    if not is_popularity_reason_question(question):
+        return None
+    text = re.sub(r'\s+', ' ', question).strip(' ?.!。！？')
+    match = re.search(
+        r'(?:^왜\s*(?:요즘|최근)?\s*)?(.+?)(?:은|는|이|가)\s*(?:왜\s*)?(?:요즘|최근)?',
+        text,
+    )
+    if not match:
+        return None
+    entity = match.group(1).strip()
+    return entity or None
 
 
 def _canonical_intent(intent: str | None) -> str:
@@ -196,9 +224,12 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
                          if word.casefold() not in question_words
                          and not any(word.casefold().startswith(prefix) for prefix in generic_prefixes)]
     entity = entity_candidates[0] if entity_candidates else None
+    entity = extract_popularity_entity(question) or entity
     entity = _alias(entity)
     if '무슨일' in compact or '무슨일이' in compact or '무슨 일' in question:
         intent = 'controversy'
+    elif entity and is_popularity_reason_question(question):
+        intent = 'popularity_reason'
     elif is_ranking_question(question):
         intent = 'trend_ranking'
     elif hints.intent == 'music_release':
@@ -227,6 +258,8 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
         normalized += ' 논란 사건 법적 대응'
     elif _canonical_intent(intent) == 'comeback':
         normalized += ' 컴백 앨범 신곡'
+    elif _canonical_intent(intent) == 'popularity_reason':
+        normalized += ' 최근 주목받는 이유'
     elif normalized_subject:
         normalized += ' ' + ' '.join(hints.keywords[1:])
     confidence = 0.9 if entity and intent != 'general' else 0.55 if entity else 0.4
@@ -235,8 +268,11 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
     analysis_intent = _canonical_intent(intent)
     if analysis_intent == 'trend_ranking':
         entity = None
+    time_range = _time_range(question)
+    if analysis_intent == 'popularity_reason' and time_range == 'unknown':
+        time_range = 'recent'
     fallback = QueryAnalysis(question, normalized.strip(), entity, analysis_intent,
-                             _time_range(question), tuple(hints.keywords), (),
+                             time_range, tuple(hints.keywords), (),
                              max(0.0, confidence))
     return QueryAnalysis(fallback.original_question, fallback.normalized_question,
                          fallback.entity, fallback.intent, fallback.time_range,
@@ -263,6 +299,7 @@ def should_use_llm(analysis: QueryAnalysis) -> bool:
 
 
 def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
+    rule_is_popularity_reason = bool(rule.entity and is_popularity_reason_question(rule.original_question))
     if 'entity' not in payload:
         entity = rule.entity
     else:
@@ -270,6 +307,9 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
         entity = _alias(raw_entity.strip()) if isinstance(raw_entity, str) and raw_entity.strip() else None
     raw_intent = payload.get('intent')
     intent = rule.intent if not raw_intent else _canonical_intent(raw_intent)
+    if rule_is_popularity_reason:
+        entity = rule.entity
+        intent = 'popularity_reason'
     if raw_intent is None and rule.intent != 'general':
         intent = rule.intent
     time_range = payload.get('time_range')
@@ -285,6 +325,9 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
     search_queries = tuple(dict.fromkeys(item.strip() for item in raw_queries if item.strip()))[:6]
     if not search_queries and intent != 'trend_ranking':
         search_queries = _fallback_search_queries(rule)
+    if intent == 'popularity_reason' and entity:
+        search_queries = (f'{entity} 최근 활동', f'{entity} 최근 이슈', f'{entity} 화제',
+                          f'{entity} 근황', f'{entity} 기사', f'{entity} 인터뷰')
     normalized = payload.get('normalized_question')
     if not isinstance(normalized, str) or not normalized.strip():
         normalized = rule.normalized_question
@@ -348,6 +391,9 @@ def expand_query(question: str, hints: QueryHints | QueryAnalysis | None = None)
                                         f'{subject} 법적 대응')))
         if hints.intent == 'comeback':
             return tuple(dict.fromkeys((subject, f'{subject} 컴백', f'{subject} 앨범', f'{subject} 신곡')))
+        if hints.intent == 'popularity_reason':
+            return (f'{subject} 최근 활동', f'{subject} 최근 이슈', f'{subject} 화제',
+                    f'{subject} 근황', f'{subject} 기사', f'{subject} 인터뷰')
         return tuple(dict.fromkeys((subject, hints.normalized_question)))
     hints = hints or analyze_query(question)
     base = list(hints.entities) or list(hints.keywords)
@@ -361,6 +407,9 @@ def expand_query(question: str, hints: QueryHints | QueryAnalysis | None = None)
         variants.extend((f'{subject} 활동', f'{subject} 출연', f'{subject} 컴백'))
     elif hints.intent == 'controversy':
         variants.extend((f'{subject} 논란', f'{subject} 사건', f'{subject} 법적 대응'))
+    elif hints.intent == 'popularity_reason':
+        variants.extend((f'{subject} 최근 활동', f'{subject} 최근 이슈', f'{subject} 화제',
+                         f'{subject} 근황', f'{subject} 기사', f'{subject} 인터뷰'))
     else:
         variants.append(question)
     return tuple(dict.fromkeys(variants))

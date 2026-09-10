@@ -57,6 +57,11 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(result.citation_ids, (1,))
         unsupported = validate_answer('테스트그룹은 큰 인기를 끌고 있습니다.[1]', [EVIDENCE])
         self.assertEqual(unsupported.answer, INSUFFICIENT_ANSWER)
+        mixed = validate_answer(
+            '테스트그룹은 게임 협업을 진행했습니다.[1]\n'
+            '그래서 실제 인기가 크게 상승했습니다.[1]', [EVIDENCE])
+        self.assertEqual(mixed.answer, '테스트그룹은 게임 협업을 진행했습니다.[1]')
+        self.assertEqual(mixed.removed_sentences, ('그래서 실제 인기가 크게 상승했습니다.[1]',))
         definition = validate_answer(
             '스트레이 키즈는 그룹이며 최근 새 앨범을 발매했습니다.[1]',
             ['그룹 스트레이 키즈가 새 앨범을 발매했습니다.'],
@@ -149,6 +154,33 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(params[1], SUPPORTED)
         self.assertEqual(len(json.loads(params[2])), 1)
         self.assertTrue(params[4])
+
+    def test_successful_answer_does_not_trigger_suggestion(self):
+        with patch.object(rag, '_search', return_value=[article(1)]), \
+                patch.object(rag, '_search_suggestions') as suggestions, \
+                patch.object(rag, 'generate_answer', return_value=SUPPORTED), \
+                patch.object(rag, 'verify_answer', return_value=SUPPORTED), \
+                patch.object(db, 'execute'):
+            result = rag.answer_question('테스트그룹 활동', 5)
+        suggestions.assert_not_called()
+        self.assertEqual(result.answer, SUPPORTED)
+
+    def test_failed_answer_suggests_a_real_entity(self):
+        candidate = article(1, '김가람 최근 활동')
+        with patch.object(rag, '_search', return_value=[]), \
+                patch.object(rag, '_search_suggestions', return_value=[candidate]), \
+                patch.object(db, 'execute'):
+            result = rag.answer_question('르세라핌 출신 김가람은 요즘 뭐해?', 5)
+        self.assertIn('김가람', result.answer)
+        self.assertIn('!ask 김가람 최근 활동 알려줘', result.answer)
+
+    def test_failed_answer_does_not_suggest_generic_title(self):
+        candidate = article(1, '뉴스 인터뷰 컴백 소식')
+        with patch.object(rag, '_search', return_value=[]), \
+                patch.object(rag, '_search_suggestions', return_value=[candidate]), \
+                patch.object(db, 'execute'):
+            result = rag.answer_question('전혀 관계없는 질문', 5)
+        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
 
     def test_verifier_cannot_reintroduce_invented_facts(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \

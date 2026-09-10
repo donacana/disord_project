@@ -4,6 +4,8 @@ import json
 import logging
 import os
 from contextvars import ContextVar
+from contextlib import contextmanager
+import time
 
 _trace = ContextVar('rag_trace', default=None)
 
@@ -18,6 +20,17 @@ def record(**fields) -> None:
 
 def snapshot() -> dict:
     return dict(_trace.get() or {})
+
+
+@contextmanager
+def measure(stage: str):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings = dict(snapshot().get('stage_seconds', {}))
+        timings[stage] = round(time.perf_counter() - started, 3)
+        record(stage_seconds=timings)
 
 
 def finish(**fields) -> None:

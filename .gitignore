@@ -11,3 +11,6 @@ __pycache__/
 
 # PyCharm
 .idea/
+
+# Disposable backend caches
+backend/.cache/

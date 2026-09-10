@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 
 if __package__:
     from . import config, diagnostics
@@ -13,7 +15,7 @@ if __package__:
                                    sentences, validate_answer)
     from .query_utils import (ARTICLE_INTENT_TERMS, GENERAL_TERMS, QueryAnalysis, analyze_query,
                                expand_query, merge_llm_analysis, rule_query_analysis)
-    from .retrieval import MIN_SIMILARITY, search
+    from .retrieval import MIN_SIMILARITY, search, search_suggestions
     from . import trend_service
     from .schemas import AskResponse, SourceItem
 else:
@@ -26,12 +28,17 @@ else:
                                  sentences, validate_answer)
     from query_utils import (ARTICLE_INTENT_TERMS, GENERAL_TERMS, QueryAnalysis, analyze_query,
                              expand_query, merge_llm_analysis, rule_query_analysis)
-    from retrieval import MIN_SIMILARITY, search
+    from retrieval import MIN_SIMILARITY, search, search_suggestions
     import trend_service
     from schemas import AskResponse, SourceItem
 
 
 MAX_CONTEXT_CHARS = 4000
+SUGGESTION_STOPWORDS = {
+    '뉴스', '포토', '인터뷰', '영화', '드라마', '컴백', '앨범', '공연', '방송',
+    '활동', '소식', '최근', '근황', '논란', '이슈', '공개', '출연', '관련',
+    '출신', '뭐해', '뭐함', '알려줘', '누구', '유명', '화제',
+}
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +74,20 @@ def _search(question: str, top_k: int, analysis: QueryAnalysis | None = None) ->
         return search(embedding, question, top_k, MIN_SIMILARITY, analysis=analysis)
     except (db.DatabaseError, OpenAIServiceError) as error:
         raise RAGError(str(error)) from error
+
+
+def _search_suggestions(question: str, top_k: int,
+                        analysis: QueryAnalysis) -> list[dict]:
+    try:
+        queries = analysis.search_queries or expand_query(question, analysis)
+        embedding_query = ' '.join(dict.fromkeys(
+            [analysis.entity or '', analysis.normalized_question, *analysis.keywords, *queries]
+        ))
+        embedding = embed_question(embedding_query[:1000])
+        return search_suggestions(embedding, question, max(top_k, 3), analysis=analysis)
+    except (db.DatabaseError, OpenAIServiceError) as error:
+        logger.warning('Suggestion retrieval failed: %s', error)
+        return []
 
 def _article_body(article: dict) -> str:
     return (article['summary'] or article['content'] or '')[:MAX_CONTEXT_CHARS]
@@ -115,6 +136,85 @@ def _source(article: dict) -> SourceItem:
         url=article['url'],
         collected_at=article['collected_at'],
     )
+
+
+def _suggestion_tokens(text: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r'[가-힣A-Za-z][가-힣A-Za-z0-9·-]{1,}', text or ''):
+        if token.casefold() not in SUGGESTION_STOPWORDS and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _suggestion_candidates(question: str, analysis: QueryAnalysis,
+                           articles: list[dict], limit: int = 3) -> list[tuple[str, float]]:
+    query_entity = (analysis.entity or '').casefold()
+    query_tokens = {token.casefold() for token in _suggestion_tokens(question)}
+    scores = {}
+    for article in articles:
+        title = article.get('title') or ''
+        text = f'{title} {article.get("summary") or ""} {article.get("content") or ""}'
+        title_tokens = _suggestion_tokens(title)
+        for candidate in title_tokens:
+            folded = candidate.casefold()
+            if len(candidate) < 2:
+                continue
+            similarity = SequenceMatcher(None, query_entity, folded).ratio() if query_entity else 0
+            direct = 1.0 if folded in query_tokens else 0.0
+            direct = max(direct, 1.0 if query_entity and (
+                query_entity in folded or folded in query_entity) else 0.0)
+            score = max(direct, similarity * 0.8) + (0.15 if candidate in title else 0)
+            scores[candidate] = max(scores.get(candidate, 0), score)
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    if not ranked:
+        return []
+    top_score = ranked[0][1]
+    return [(name, score) for name, score in ranked[:limit]
+            if score >= 0.45 and (score == top_score or score >= top_score - 0.2)]
+
+
+def _suggested_question(analysis: QueryAnalysis, entity: str) -> str:
+    templates = {
+        'definition': f'{entity}은 누구야?',
+        'controversy': f'{entity} 최근 논란 알려줘',
+        'popularity_reason': f'{entity}이 왜 요즘 화제야?',
+    }
+    return templates.get(analysis.intent, f'{entity} 최근 활동 알려줘')
+
+
+def _suggestion_response(question: str, analysis: QueryAnalysis, articles: list[dict],
+                         started: float, reason: str) -> AskResponse:
+    candidates = _suggestion_candidates(question, analysis, articles)
+    if not candidates:
+        answer = INSUFFICIENT_ANSWER
+        diagnostics.record(suggestion_triggered=True, suggestion_candidate_count=0)
+    else:
+        names = [name for name, _ in candidates]
+        if len(names) == 1:
+            body = f"혹시 **{names[0]}**을(를) 찾으신 건가요?"
+        else:
+            body = '현재 질문과 가장 가까운 후보는 다음과 같습니다.\n\n' + '\n'.join(
+                f'{index}. {name}' for index, name in enumerate(names, 1))
+        suggested = _suggested_question(analysis, names[0])
+        answer = (f'현재 질문 그대로는 충분한 근거를 찾지 못했습니다.\n\n{body}\n\n'
+                  f'다시 이렇게 질문해보세요:\n`!ask {suggested}`')
+        diagnostics.record(suggestion_triggered=True,
+                           suggestion_candidate_count=len(candidates),
+                           suggestion_top_candidate=names[0],
+                           suggestion_similarity=round(candidates[0][1], 3),
+                           suggested_question=suggested)
+    if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+        trace = diagnostics.snapshot()
+        logger.warning('[SUGGESTION] triggered=true original_question=%s original_entity=%s '
+                       'candidate_count=%d top_candidate=%s similarity=%s suggested_question=%s',
+                       question, analysis.entity or '', len(candidates),
+                       trace.get('suggestion_top_candidate', ''),
+                       trace.get('suggestion_similarity', ''),
+                       trace.get('suggested_question', ''))
+    diagnostics.finish(generated_answer='', validated_answer='', final_answer=answer,
+                       insufficient_reason=reason)
+    _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
+    return AskResponse(answer=answer, sources=[], domain='ent_culture')
 
 
 def _title_fallback(question: str, reviewed: str, results: list[dict], checked,
@@ -193,10 +293,11 @@ def _trend_category_hint(analysis: QueryAnalysis) -> str | None:
 def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResponse:
     started = time.perf_counter()
     now = datetime.now().astimezone()
-    items, scanned = trend_service.aggregate(
-        analysis.time_range, top_k=min(top_k, config.TREND_TOP_K),
-        category_hint=_trend_category_hint(analysis), now=now,
-    )
+    with diagnostics.measure('trend_aggregation'):
+        items, scanned = trend_service.aggregate(
+            analysis.time_range, top_k=min(top_k, config.TREND_TOP_K),
+            category_hint=_trend_category_hint(analysis), now=now,
+        )
     diagnostics.record(articles_scanned=scanned, top_entities=[
         {'name': item.name, 'mention_count': item.mention_count,
          'source_count': item.source_count, 'score': round(item.score, 4)} for item in items])
@@ -215,7 +316,8 @@ def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResp
              f'현재 DB 수집 기사 중 최신 {scanned}건을 조회한 결과이며, '
              '기사 언급량, 출처 다양성, 최근성을 반영한 순위입니다. '
              '전체 대중 인기도나 긍정적인 활동량 순위는 아닙니다.')
-    if diagnostics.snapshot().get('entity_extraction_failures'):
+    if (diagnostics.snapshot().get('entity_extraction_failures')
+            or diagnostics.snapshot().get('entity_extraction_incomplete_articles')):
         scope += ' 일부 기사 묶음의 인물 분석이 완료되지 않아 확인된 후보만 포함한 부분 집계입니다.'
     results, evidence, fallback, manifest = [], [], [], []
     for item in items:
@@ -250,11 +352,13 @@ def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResp
     context = ('RANKED_ENTITIES: ' + json.dumps(manifest, ensure_ascii=False) + '\n\n' +
                '\n\n'.join(f'[{i}]\n{text}' for i, text in enumerate(evidence, 1)))
     try:
-        draft = generate_trend_answer(question, context)
+        with diagnostics.measure('answer_generation'):
+            draft = generate_trend_answer(question, context)
     except OpenAIServiceError:
         draft = '\n'.join(fallback)
     try:
-        reviewed = verify_answer(question, context, draft)
+        with diagnostics.measure('answer_verification'):
+            reviewed = verify_answer(question, context, draft)
         checked = validate_answer(reviewed, evidence, semantic_verified=True)
     except OpenAIServiceError:
         checked = validate_answer(draft, evidence, require_extract=True)
@@ -290,35 +394,53 @@ def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResp
 def answer_question(question: str, top_k: int) -> AskResponse:
     started = time.perf_counter()
     diagnostics.begin(question)
-    analysis, llm_used = _query_analysis(question)
+    with diagnostics.measure('query_understanding'):
+        analysis, llm_used = _query_analysis(question)
     diagnostics.record(intent=analysis.intent, target_type=analysis.target_type,
-                       route='trend_service.aggregate' if analysis.intent == 'trend_ranking' else 'rag',
+                       route='trend_service.aggregate' if analysis.intent == 'trend_ranking'
+                       else 'normal_rag' if analysis.intent == 'popularity_reason' else 'rag',
                        query_analysis=analysis.__dict__, llm_used=llm_used)
     if analysis.intent == 'trend_ranking':
         return _answer_trend(question, analysis, top_k)
-    results = _search(question, top_k, analysis)
-    diagnostics.record(retrieved_docs=len(results), final_docs=len(results))
+    with diagnostics.measure('retrieval'):
+        results = _search(question, top_k, analysis)
+    entity = (analysis.entity or '').casefold()
+    entity_exact_docs = [article for article in results if entity and entity in (
+        f'{article.get("title") or ""} {article.get("summary") or ""} '
+        f'{article.get("content") or ""}'
+    ).casefold()]
+    recent_docs = []
+    if analysis.time_range == 'recent':
+        now = datetime.now().astimezone()
+        for article in results:
+            published_at = article.get('published_at')
+            if isinstance(published_at, datetime) and (now - published_at.astimezone(now.tzinfo)).days <= 30:
+                recent_docs.append(article)
+    diagnostics.record(retrieved_docs=len(results), candidate_docs=len(results),
+                       final_docs=len(results), entity_exact_docs=len(entity_exact_docs),
+                       recent_docs=len(recent_docs))
     if not results:
         if os.getenv('RAG_DEBUG', '').casefold() == 'true':
+            logger.warning('[RETRIEVAL] candidate_docs=0 final_docs=0 entity_exact_docs=0 recent_docs=0')
             logger.warning('[RAG] question=%s intent=%s entity=%s candidate_docs=0 '
-                           'final_docs=0 generated_sentences=0 supported_sentences=0 '
+                           'final_docs=0 generated_sentences=0 validated_sentences=0 '
                            'removed_sentences=0 insufficient_reason=no_retrieval_results',
                            question, analysis.intent, analysis.entity or '')
-        answer = INSUFFICIENT_ANSWER
-        diagnostics.finish(generated_answer='', validated_answer='', final_answer=answer,
-                           insufficient_reason='no_retrieval_results')
-        _log_result(question, answer, [], None, False, int((time.perf_counter() - started) * 1000))
-        return AskResponse(answer=answer, sources=[], domain='ent_culture')
+        suggestion_results = _search_suggestions(question, top_k, analysis)
+        return _suggestion_response(question, analysis, suggestion_results, started,
+                        'no_retrieval_results')
 
     try:
         context = _context(results)
-        draft = generate_answer(question, context)
+        with diagnostics.measure('answer_generation'):
+            draft = generate_answer(question, context)
     except OpenAIServiceError as error:
         raise RAGError(str(error)) from error
     evidence = _evidence(results)
     draft_check = validate_answer(draft, evidence)
     try:
-        reviewed = verify_answer(question, context, draft)
+        with diagnostics.measure('answer_verification'):
+            reviewed = verify_answer(question, context, draft)
         semantic_verified = True
     except OpenAIServiceError:
         # The local validator still protects the draft when semantic review fails.
@@ -333,6 +455,10 @@ def answer_question(question: str, top_k: int) -> AskResponse:
         checked = validate_answer(draft, evidence, require_extract=True)
         logger.info('Verifier removed all claims; restored locally grounded draft sentences.')
     checked = _title_fallback(question, reviewed, results, checked, analysis)
+    if not checked.citation_ids:
+        suggestion_results = _search_suggestions(question, top_k, analysis)
+        return _suggestion_response(question, analysis, suggestion_results or results, started,
+                                    'no_supported_sentence_after_validation')
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)
     diagnostics.finish(generated_answer=draft, validated_answer=checked.answer,
@@ -340,10 +466,12 @@ def answer_question(question: str, top_k: int) -> AskResponse:
                        validation_reasons=checked.reasons,
                        insufficient_reason=None if used_results else 'no_supported_sentence_after_validation')
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
-        logger.warning('[QUERY] original=%s rule_intent=%s llm_used=%s entity=%s '
-                       'intent=%s time_range=%s confidence=%.2f normalized=%s keywords=%s search_queries=%s',
+        route = 'trend_service.aggregate' if analysis.intent == 'trend_ranking' else 'normal_rag'
+        logger.warning('[QUERY] question=%s entity=%s intent=%s time_range=%s route=%s '
+                   'original=%s rule_intent=%s llm_used=%s confidence=%.2f normalized=%s '
+                   'keywords=%s search_queries=%s',
+                   question, analysis.entity, analysis.intent, analysis.time_range, route,
                        question, rule_query_analysis(question).intent, llm_used,
-                       analysis.entity, analysis.intent, analysis.time_range,
                        analysis.confidence, analysis.normalized_question, list(analysis.keywords),
                        list(analysis.search_queries))
         expanded_queries = expand_query(question, analysis)
@@ -353,10 +481,15 @@ def answer_question(question: str, top_k: int) -> AskResponse:
                            question, analysis.entity, list(expanded_queries),
                            len(results), len(used_results))
         logger.warning('[RAG] question=%s intent=%s entity=%s after_filter=%d '
-                       'generated_answer=%s generated_sentences=%d validated_sentences=%d removed_sentences=%d',
-                       question, analysis.intent, analysis.entity or '', len(results),
-                       bool(draft.strip()), len(sentences(draft)), len(checked.citation_ids),
-                       len(checked.removed_sentences))
+                   'generated_answer=%s generated_sentences=%d validated_sentences=%d removed_sentences=%d',
+                   question, analysis.intent, analysis.entity or '', len(results),
+                   bool(draft.strip()), len(sentences(draft)), len(checked.citation_ids),
+                   len(checked.removed_sentences))
+        logger.warning('[RETRIEVAL] candidate_docs=%d final_docs=%d entity_exact_docs=%d recent_docs=%d',
+                   len(results), len(used_results), len(entity_exact_docs), len(recent_docs))
+        logger.warning('[ANSWER] generated_sentences=%d validated_sentences=%d removed_sentences=%d final_answer=%s',
+                   len(sentences(draft)), len(sentences(checked.answer)),
+                   len(checked.removed_sentences), bool(answer.strip()))
         if not checked.citation_ids:
             logger.warning('[RAG] insufficient_reason=no_supported_sentence_after_validation')
         logger.warning('answer_validation draft_removed=%d final_removed=%d replaced=%d citations=%s',
