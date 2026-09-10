@@ -150,6 +150,7 @@ def _suggestion_candidates(question: str, analysis: QueryAnalysis,
                            articles: list[dict], limit: int = 3) -> list[tuple[str, float]]:
     query_entity = (analysis.entity or '').casefold()
     query_tokens = {token.casefold() for token in _suggestion_tokens(question)}
+    query_tokens.update(token.casefold() for token in analysis.keywords)
     scores = {}
     for article in articles:
         title = article.get('title') or ''

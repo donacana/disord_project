@@ -166,7 +166,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.answer, SUPPORTED)
 
     def test_failed_answer_suggests_a_real_entity(self):
-        candidate = article(1, '김가람 최근 활동')
+        candidate = article(1)
+        candidate['title'] = '김가람 최근 활동'
         with patch.object(rag, '_search', return_value=[]), \
                 patch.object(rag, '_search_suggestions', return_value=[candidate]), \
                 patch.object(db, 'execute'):
