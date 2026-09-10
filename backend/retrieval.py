@@ -273,6 +273,5 @@ def search_suggestions(embedding: list[float], question: str, top_k: int,
         row = score_candidate(original, hints, now)
         if row is None or row['similarity'] < config.SUGGESTION_THRESHOLD:
             continue
-        if row['entity_score'] or row['keyword_score'] or row['title_score']:
-            scored.append(row)
+        scored.append(row)
     return sorted(scored, key=lambda row: (-row['final_score'], -row['similarity']))[:top_k]

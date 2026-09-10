@@ -140,6 +140,29 @@ class TrendRankingTests(unittest.TestCase):
         self.assertEqual([(item.name, item.mention_count, item.source_count) for item in result],
                          [('스트레이 키즈', 2, 2)])
 
+    def test_work_extractors_do_not_rank_people(self):
+        song_title = "타이틀곡 'BORN DIRE' 스윙스 참여"
+        movie_title = "영화 '타짜: 벨제붑의 노래' 박스오피스 진입"
+        drama_title = "디즈니+ 오리지널 시리즈 '메이드 인 코리아 시즌2' 방영"
+        self.assertEqual(trend_service.extract_song_candidates(song_title), ['BORN DIRE'])
+        self.assertEqual(trend_service.extract_movie_candidates(movie_title), ['타짜: 벨제붑의 노래'])
+        self.assertEqual(trend_service.extract_drama_candidates(drama_title), ['메이드 인 코리아 시즌2'])
+
+        rows = [row(1, song_title, 'A'), row(2, song_title, 'B'),
+                row(3, '스윙스 김유정 현빈 르세라핌 근황', 'C')]
+        result = trend_service.aggregate_rows(rows, NOW, top_k=5, category_hint='song')
+        self.assertEqual([item.name for item in result], ['BORN DIRE'])
+        self.assertEqual(result[0].candidate_type, 'song')
+
+    def test_target_type_extractor_diagnostics_and_empty_type_result(self):
+        with patch.object(db, 'fetch_all', return_value=[
+            row(1, '스윙스 김유정 현빈 르세라핌 근황', 'A')
+        ]), patch.object(trend_service, '_work_entity_rows', wraps=trend_service._work_entity_rows) as extract:
+            results, _ = trend_service.aggregate('recent', category_hint='song', now=NOW)
+        self.assertEqual(results, [])
+        self.assertEqual(extract.call_args.args[1], 'song')
+        self.assertEqual(diagnostics.snapshot()['extractor_used'], 'extract_song_candidates')
+
     def test_trend_context_contains_representative_bodies(self):
         first = row(1, 'A그룹 새 앨범', 'A')
         first['content'] = 'A그룹이 새 앨범을 발매했다.'

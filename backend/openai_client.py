@@ -28,7 +28,7 @@ def analyze_question(question: str) -> dict:
         '있다는 이유만으로 순위 질문으로 분류하지 마라.\n'
         '요즘 어떤 아이돌이 유명해?, 요즘 누가 유명해?, 최근 활동이 많은 아이돌 알려줘, '
         '최근 화제인 배우 알려줘는 모두 entity=null, intent=trend_ranking, time_range=recent이다.\n'
-        'target_type은 idol_or_group, actor, entertainer, work, general 중 하나다. '
+        'target_type은 song, movie, drama, idol_or_group, actor, entertainer, work, general 중 하나다. '
         '아이돌 질문은 idol_or_group, 배우 질문은 actor, 누가 유명해는 entertainer이다. '
         '스키즈 요즘 뭐함?은 entity=스트레이 키즈, intent=activity이다. '
         '특정 인물의 활동 질문을 집단 순위로 바꾸지 마라.\n'
@@ -50,7 +50,7 @@ def analyze_question(question: str) -> dict:
             'original_question': {'type': 'string'},
             'normalized_question': {'type': 'string'},
             'entity': {'type': ['string', 'null']},
-            'target_type': {'type': 'string', 'enum': ['idol_or_group', 'actor', 'entertainer', 'work', 'general']},
+            'target_type': {'type': 'string', 'enum': ['song', 'movie', 'drama', 'idol_or_group', 'actor', 'entertainer', 'work', 'general']},
             'intent': {'type': 'string', 'enum': [
                 'definition', 'activity', 'controversy', 'comeback', 'movie', 'drama',
                 'show', 'event', 'trend', 'trend_ranking', 'general',

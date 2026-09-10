@@ -97,9 +97,19 @@ class QueryAnalysis:
     search_queries: tuple[str, ...]
     confidence: float
     target_type: str = 'entertainer'
+    main_entity: str | None = None
+    context_entity: str | None = None
+    context_type: str | None = None
+    profession_hint: str | None = None
 
 
 def target_type(question: str) -> str:
+    if any(term in question for term in ('노래', '신곡', '타이틀곡', '싱글', 'OST', '수록곡', '음원', '차트')):
+        return 'song'
+    if any(term in question for term in ('박스오피스', '영화', '개봉', '시사회')):
+        return 'movie'
+    if any(term in question for term in ('드라마', '시리즈', '시즌', '방영', 'OTT')):
+        return 'drama'
     if any(term in question for term in ('아이돌', '그룹')):
         return 'idol_or_group'
     if any(term in question for term in ('배우', '연기자')):
@@ -109,8 +119,14 @@ def target_type(question: str) -> str:
 
 def is_ranking_question(question: str) -> bool:
     compact = re.sub(r'\s+', '', question)
-    population = any(term in compact for term in ('누가', '누구', '어떤아이돌', '아이돌', '배우', '그룹', '연예인', '화제인물'))
-    ranking = any(term in compact for term in ('유명', '핫', '뜨는', '화제', '많이언급', '활동이많', '활동많'))
+    population = any(term in compact for term in (
+        '누가', '누구', '어떤아이돌', '아이돌', '배우', '그룹', '연예인', '화제인물',
+        '노래', '곡', '신곡', '영화', '드라마', '시리즈',
+    ))
+    ranking = any(term in compact for term in (
+        '유명', '인기', '핫', '뜨는', '화제', '주목', '박스오피스', '많이언급',
+        '활동이많', '활동많',
+    ))
     return population and ranking
 
 
@@ -166,6 +182,34 @@ def _alias(value: str | None) -> str | None:
     if not value:
         return None
     return ENTITY_ALIASES.get(value.casefold(), value)
+
+
+PROFESSION_HINTS = {
+    '개그맨': 'comedian', '코미디언': 'comedian', '배우': 'actor',
+    '가수': 'singer', '아이돌': 'idol', '그룹': 'group',
+}
+
+
+def extract_entity_context(question: str, keywords: list[str]) -> tuple[str | None, str | None, str | None, str | None]:
+    """Extract the asked subject separately from former-group/profession context."""
+    text = re.sub(r'\s+', ' ', question).strip()
+    profession = next((term for term in PROFESSION_HINTS if term in text), None)
+    profession_hint = PROFESSION_HINTS.get(profession) if profession else None
+
+    former_group = re.search(r'(.+?)\s+출신\s+(.+?)(?=(?:은|는|이|가|을|를)\s|\s|$)', text)
+    if former_group:
+        context = _alias(former_group.group(1).strip())
+        entity = former_group.group(2).strip()
+        return entity, context, 'former_group', profession_hint
+
+    if profession:
+        match = re.search(rf'{re.escape(profession)}\s+(.+?)(?=(?:은|는|이|가|을|를)\s|\s|$)', text)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate not in GENERAL_TERMS:
+                return candidate, None, 'profession', profession_hint
+
+    return None, None, None, profession_hint
 
 
 def extract_keywords(question: str) -> list[str]:
@@ -224,6 +268,9 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
                          if word.casefold() not in question_words
                          and not any(word.casefold().startswith(prefix) for prefix in generic_prefixes)]
     entity = entity_candidates[0] if entity_candidates else None
+    main_entity, context_entity, context_type, profession_hint = extract_entity_context(
+        question, list(entity_candidates))
+    entity = main_entity or entity
     entity = extract_popularity_entity(question) or entity
     entity = _alias(entity)
     if '무슨일' in compact or '무슨일이' in compact or '무슨 일' in question:
@@ -277,7 +324,9 @@ def rule_query_analysis(question: str) -> QueryAnalysis:
     return QueryAnalysis(fallback.original_question, fallback.normalized_question,
                          fallback.entity, fallback.intent, fallback.time_range,
                          fallback.keywords, _fallback_search_queries(fallback),
-                         fallback.confidence, target_type(question))
+                         fallback.confidence, target_type(question),
+                         main_entity=fallback.entity, context_entity=context_entity,
+                         context_type=context_type, profession_hint=profession_hint)
 
 
 def _fallback_search_queries(analysis: QueryAnalysis) -> tuple[str, ...]:
@@ -336,10 +385,17 @@ def merge_llm_analysis(rule: QueryAnalysis, payload: dict) -> QueryAnalysis:
     except (TypeError, ValueError):
         confidence = rule.confidence
     target = payload.get('target_type', rule.target_type)
-    if target not in {'idol_or_group', 'actor', 'entertainer', 'work', 'general'}:
+    if target not in {'song', 'movie', 'drama', 'idol_or_group', 'actor',
+                      'entertainer', 'work', 'general'}:
+        target = rule.target_type
+    if rule.target_type in {'song', 'movie', 'drama'}:
         target = rule.target_type
     return QueryAnalysis(rule.original_question, normalized.strip(), entity, intent, time_range,
-                         keywords, search_queries, confidence, target)
+                         keywords, search_queries, confidence, target,
+                         main_entity=rule.main_entity or entity,
+                         context_entity=rule.context_entity,
+                         context_type=rule.context_type,
+                         profession_hint=rule.profession_hint)
 
 
 def analysis_to_hints(analysis: QueryAnalysis) -> QueryHints:

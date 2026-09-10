@@ -53,6 +53,13 @@ class RetrievalTests(unittest.TestCase):
                                                   rule_query_analysis('르세라핌 출신 김가람은 요즘 뭐해?'))
         self.assertEqual([row['article_id'] for row in result], [1])
 
+    def test_query_analysis_separates_main_context_and_profession(self):
+        analysis = rule_query_analysis('르세라핌 출신 김가람은 요즘 뭐해?')
+        self.assertEqual((analysis.main_entity, analysis.context_entity, analysis.context_type),
+                         ('김가람', '르세라핌', 'former_group'))
+        comedian = rule_query_analysis('개그맨 최양락은 요즘 뭐해?')
+        self.assertEqual((comedian.main_entity, comedian.profession_hint), ('최양락', 'comedian'))
+
     def test_recency_and_no_keyword_fallback(self):
         for days, expected in [(0, 1), (7, 1), (8, .7), (30, .7), (31, .3), (90, .3), (91, 0)]:
             self.assertEqual(retrieval.recency_score(NOW - timedelta(days=days), NOW), expected)
@@ -88,6 +95,20 @@ class RetrievalTests(unittest.TestCase):
             hints = analyze_query(question)
             self.assertEqual((hints.entities, hints.intent, hints.categories, hints.recent_days),
                              (entities, intent, categories, days))
+
+    def test_trend_target_types(self):
+        cases = [
+            ('요즘 어떤 노래가 유명해?', 'song'),
+            ('최근 인기 신곡 알려줘', 'song'),
+            ('현재 박스오피스에서 주목할 영화 알려줘', 'movie'),
+            ('요즘 어떤 드라마가 화제야?', 'drama'),
+            ('최근 화제인 배우 알려줘', 'actor'),
+            ('요즘 어떤 아이돌이 유명해?', 'idol_or_group'),
+        ]
+        for question, expected in cases:
+            analysis = rule_query_analysis(question)
+            self.assertEqual(analysis.intent, 'trend_ranking', question)
+            self.assertEqual(analysis.target_type, expected, question)
 
     def test_definition_activity_and_query_expansion(self):
         definition_questions = [

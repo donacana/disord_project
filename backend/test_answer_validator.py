@@ -173,18 +173,48 @@ class PipelineTests(unittest.TestCase):
                 patch.object(db, 'execute'):
             result = rag.answer_question('르세라핌 출신 김가람은 요즘 뭐해?', 5)
         self.assertIn('김가람', result.answer)
-        self.assertIn('!ask 김가람 최근 활동 알려줘', result.answer)
+        self.assertIn('!연예질문 김가람 최근 활동 알려줘', result.answer)
 
     def test_failed_answer_does_not_suggest_generic_title(self):
-        candidate = article(1, '뉴스 인터뷰 컴백 소식')
+        candidate = article(1)
+        candidate['title'] = '뉴스 인터뷰 컴백 소식'
         with patch.object(rag, '_search', return_value=[]), \
                 patch.object(rag, '_search_suggestions', return_value=[candidate]), \
                 patch.object(db, 'execute'):
             result = rag.answer_question('전혀 관계없는 질문', 5)
         self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
 
+    def test_same_name_candidates_are_not_selected_automatically(self):
+        analysis = rag.rule_query_analysis('김가람 최근 활동 알려줘')
+        articles = [
+            {'title': '배우 김가람 드라마 출연', 'content': '', 'summary': '', 'similarity': .7},
+            {'title': '가수 김가람 앨범 발표', 'content': '', 'summary': '', 'similarity': .7},
+        ]
+        plan = rag._build_suggestion_plan(analysis.original_question, analysis, articles)
+        self.assertEqual(plan.selected_method, 'same_name')
+        self.assertEqual(len(plan.selected_candidates), 2)
+
+    def test_similar_name_and_vector_fallback_have_distinct_methods(self):
+        similar_analysis = rag.rule_query_analysis('최양락a 최근 활동 알려줘')
+        similar_article = {'title': '최양락 최근 활동', 'content': '', 'summary': '', 'similarity': .4}
+        similar_plan = rag._build_suggestion_plan(
+            similar_analysis.original_question, similar_analysis, [similar_article])
+        self.assertEqual(similar_plan.selected_method, 'similar_name')
+
+        vector_analysis = rag.rule_query_analysis('완전히 다른 인물 최근 활동 알려줘')
+        vector_article = {'title': '장원영 최근 활동', 'content': '', 'summary': '', 'similarity': .7}
+        vector_plan = rag._build_suggestion_plan(
+            vector_analysis.original_question, vector_analysis, [vector_article])
+        self.assertEqual(vector_plan.selected_method, 'vector')
+
+        weak_article = {'title': '장원영 최근 활동', 'content': '', 'summary': '', 'similarity': .1}
+        weak_plan = rag._build_suggestion_plan(
+            vector_analysis.original_question, vector_analysis, [weak_article])
+        self.assertIsNone(weak_plan.selected_method)
+
     def test_verifier_cannot_reintroduce_invented_facts(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
+            patch.object(rag, '_search_suggestions', return_value=[]), \
                 patch.object(rag, 'generate_answer', return_value=SUPPORTED), \
                 patch.object(rag, 'verify_answer', return_value='테스트그룹 2026년 데뷔.[1]'), \
                 patch.object(db, 'execute') as log:
@@ -195,6 +225,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_verifier_failure_and_missing_results_fail_closed(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
+            patch.object(rag, '_search_suggestions', return_value=[]), \
                 patch.object(rag, 'generate_answer', return_value=SUPPORTED), \
                 patch.object(rag, 'verify_answer', side_effect=openai_client.OpenAIServiceError('failed')) as verify, \
                 patch.object(db, 'execute'):
@@ -203,6 +234,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(result.sources), 1)
         verify.assert_called_once()
         with patch.object(rag, '_search', return_value=[]), \
+            patch.object(rag, '_search_suggestions', return_value=[]), \
                 patch.object(rag, 'generate_answer') as generate, \
                 patch.object(rag, 'verify_answer') as verify, patch.object(db, 'execute'):
             result = rag.answer_question('활동', 5)
@@ -214,6 +246,7 @@ class PipelineTests(unittest.TestCase):
         # All words could be present while the subject/action relationship is
         # wrong. The verifier's conservative decision must survive the pipeline.
         with patch.object(rag, '_search', return_value=[article(1)]), \
+            patch.object(rag, '_search_suggestions', return_value=[]), \
                 patch.object(rag, 'generate_answer', return_value=SUPPORTED), \
                 patch.object(rag, 'verify_answer', return_value=INSUFFICIENT_ANSWER), \
                 patch.object(db, 'execute'):

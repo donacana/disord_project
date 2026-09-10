@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime
 from difflib import SequenceMatcher
+from dataclasses import dataclass
 
 if __package__:
     from . import config, diagnostics
@@ -35,11 +36,22 @@ else:
 
 MAX_CONTEXT_CHARS = 4000
 SUGGESTION_STOPWORDS = {
-    '뉴스', '포토', '인터뷰', '영화', '드라마', '컴백', '앨범', '공연', '방송',
+    '뉴스', '기사', '포토', '인터뷰', '영화', '드라마', '컴백', '앨범', '공연', '공연형', '방송',
     '활동', '소식', '최근', '근황', '논란', '이슈', '공개', '출연', '관련',
     '출신', '뭐해', '뭐함', '알려줘', '누구', '유명', '화제',
 }
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SuggestionPlan:
+    exact_match_count: int
+    same_name_candidates: tuple[str, ...]
+    similar_name_candidates: tuple[str, ...]
+    vector_candidates: tuple[str, ...]
+    selected_method: str | None
+    selected_candidates: tuple[str, ...]
+    similarity: float | None
 
 
 class RAGError(RuntimeError):
@@ -154,7 +166,6 @@ def _suggestion_candidates(question: str, analysis: QueryAnalysis,
     scores = {}
     for article in articles:
         title = article.get('title') or ''
-        text = f'{title} {article.get("summary") or ""} {article.get("content") or ""}'
         title_tokens = _suggestion_tokens(title)
         for candidate in title_tokens:
             folded = candidate.casefold()
@@ -164,7 +175,12 @@ def _suggestion_candidates(question: str, analysis: QueryAnalysis,
             direct = 1.0 if folded in query_tokens else 0.0
             direct = max(direct, 1.0 if query_entity and (
                 query_entity in folded or folded in query_entity) else 0.0)
-            score = max(direct, similarity * 0.8) + (0.15 if candidate in title else 0)
+            try:
+                vector_score = (max(0.0, min(1.0, float(article['similarity']))) * 0.8
+                                if 'similarity' in article else 0.0)
+            except (TypeError, ValueError):
+                vector_score = 0.0
+            score = max(direct, similarity * 0.8, vector_score) + (0.15 if candidate in title else 0)
             scores[candidate] = max(scores.get(candidate, 0), score)
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
     if not ranked:
@@ -172,6 +188,65 @@ def _suggestion_candidates(question: str, analysis: QueryAnalysis,
     top_score = ranked[0][1]
     return [(name, score) for name, score in ranked[:limit]
             if score >= 0.45 and (score == top_score or score >= top_score - 0.2)]
+
+
+def _same_name_labels(analysis: QueryAnalysis, entity: str,
+                      articles: list[dict]) -> set[str]:
+    labels = set()
+    profession_names = {
+        'comedian': '개그맨', 'actor': '배우', 'singer': '가수', 'idol': '아이돌',
+    }
+    for article in articles:
+        text = ' '.join(str(article.get(key) or '') for key in ('title', 'summary', 'content'))
+        for hint, korean in profession_names.items():
+            if korean in text:
+                labels.add(f'{korean} {entity}')
+        if analysis.context_entity and analysis.context_entity.casefold() in text.casefold():
+            labels.add(f'{analysis.context_entity} 관련 {entity}')
+    return labels
+
+
+def _build_suggestion_plan(question: str, analysis: QueryAnalysis,
+                           articles: list[dict]) -> SuggestionPlan:
+    main_entity = analysis.main_entity or analysis.entity
+    folded_entity = (main_entity or '').casefold()
+    exact_articles = []
+    if folded_entity:
+        exact_articles = [
+            article for article in articles
+            if folded_entity in ' '.join(str(article.get(key) or '')
+                                         for key in ('title', 'summary', 'content')).casefold()
+        ]
+
+    same_name_labels = _same_name_labels(analysis, main_entity or '', exact_articles)
+    if len(same_name_labels) > 1:
+        return SuggestionPlan(len(exact_articles), tuple(sorted(same_name_labels)), (), (),
+                              'same_name', tuple(sorted(same_name_labels)), 1.0)
+
+    scored = _suggestion_candidates(question, analysis, articles, limit=5)
+    compact_entity = re.sub(r'\s+', '', folded_entity)
+    similar = []
+    vector = []
+    for name, score in scored:
+        compact_name = re.sub(r'\s+', '', name.casefold())
+        if compact_entity and compact_name == compact_entity:
+            continue
+        if score >= 0.75:
+            similar.append(name)
+        else:
+            vector.append(name)
+    if similar:
+        method = 'similar_name'
+        selected = tuple(dict.fromkeys(similar))
+    elif vector:
+        method = 'vector'
+        selected = tuple(dict.fromkeys(vector))
+    else:
+        method = 'exact' if exact_articles else None
+        selected = (main_entity,) if method == 'exact' and main_entity else ()
+    similarity = scored[0][1] if scored else (1.0 if exact_articles else None)
+    return SuggestionPlan(len(exact_articles), (), tuple(dict.fromkeys(similar)),
+                          tuple(dict.fromkeys(vector)), method, selected, similarity)
 
 
 def _suggested_question(analysis: QueryAnalysis, entity: str) -> str:
@@ -185,30 +260,49 @@ def _suggested_question(analysis: QueryAnalysis, entity: str) -> str:
 
 def _suggestion_response(question: str, analysis: QueryAnalysis, articles: list[dict],
                          started: float, reason: str) -> AskResponse:
-    candidates = _suggestion_candidates(question, analysis, articles)
+    plan = _build_suggestion_plan(question, analysis, articles)
+    candidates = plan.selected_candidates
+    diagnostics.record(
+        suggestion_triggered=True,
+        suggestion_exact_match_count=plan.exact_match_count,
+        suggestion_same_name_candidates=list(plan.same_name_candidates),
+        suggestion_similar_name_candidates=list(plan.similar_name_candidates),
+        suggestion_vector_candidates=list(plan.vector_candidates),
+        suggestion_selected_method=plan.selected_method,
+    )
     if not candidates:
         answer = INSUFFICIENT_ANSWER
-        diagnostics.record(suggestion_triggered=True, suggestion_candidate_count=0)
+        diagnostics.record(suggestion_candidate_count=0)
     else:
-        names = [name for name, _ in candidates]
-        if len(names) == 1:
-            body = f"혹시 **{names[0]}**을(를) 찾으신 건가요?"
+        names = list(candidates[:3])
+        if plan.selected_method == 'same_name':
+            answer = ('현재 동일하거나 유사한 이름의 후보가 여러 명 확인됩니다.\n\n' +
+                      '\n'.join(f'- {name}' for name in names) +
+                      '\n\n찾으시는 대상을 조금 더 구체적으로 입력해주세요.\n\n'
+                      f'예:\n`!연예질문 {names[0]} 최근 활동 알려줘`')
+            suggested = f'{names[0]} 최근 활동 알려줘'
         else:
-            body = '현재 질문과 가장 가까운 후보는 다음과 같습니다.\n\n' + '\n'.join(
-                f'{index}. {name}' for index, name in enumerate(names, 1))
-        suggested = _suggested_question(analysis, names[0])
-        answer = (f'현재 질문 그대로는 충분한 근거를 찾지 못했습니다.\n\n{body}\n\n'
-                  f'다시 이렇게 질문해보세요:\n`!ask {suggested}`')
+            body = (f"질문과 가장 가까운 후보는 **{names[0]}**입니다.\n\n"
+                    f"혹시 **{names[0]}**을(를) 찾으신 건가요?")
+            suggested = _suggested_question(analysis, names[0])
+            answer = (f'현재 질문 그대로는 충분한 근거를 찾지 못했습니다.\n\n{body}\n\n'
+                      f'다시 이렇게 질문해보세요:\n`!연예질문 {suggested}`')
         diagnostics.record(suggestion_triggered=True,
-                           suggestion_candidate_count=len(candidates),
+                           suggestion_candidate_count=len(names),
                            suggestion_top_candidate=names[0],
-                           suggestion_similarity=round(candidates[0][1], 3),
+                           suggestion_similarity=round(plan.similarity or 0, 3),
                            suggested_question=suggested)
     if os.getenv('RAG_DEBUG', '').casefold() == 'true':
         trace = diagnostics.snapshot()
-        logger.warning('[SUGGESTION] triggered=true original_question=%s original_entity=%s '
-                       'candidate_count=%d top_candidate=%s similarity=%s suggested_question=%s',
-                       question, analysis.entity or '', len(candidates),
+        logger.warning('[SUGGESTION] triggered=true original_question=%s main_entity=%s '
+                   'context_entity=%s profession_hint=%s '
+                   'exact_match_count=%d same_name_candidates=%s similar_name_candidates=%s '
+                   'vector_candidates=%s selected_method=%s selected_candidate=%s similarity=%s '
+                   'suggested_question=%s',
+                   question, analysis.main_entity or analysis.entity or '', analysis.context_entity or '',
+                   analysis.profession_hint or '', plan.exact_match_count,
+                   list(plan.same_name_candidates), list(plan.similar_name_candidates),
+                   list(plan.vector_candidates), plan.selected_method,
                        trace.get('suggestion_top_candidate', ''),
                        trace.get('suggestion_similarity', ''),
                        trace.get('suggested_question', ''))
@@ -279,6 +373,8 @@ def _log_result(question: str, answer: str, results: list[dict], top_score: floa
 
 
 def _trend_category_hint(analysis: QueryAnalysis) -> str | None:
+    if analysis.target_type in {'song', 'movie', 'drama'}:
+        return analysis.target_type
     if analysis.target_type == 'idol_or_group':
         return 'idol'
     if analysis.target_type == 'actor':
@@ -301,9 +397,14 @@ def _answer_trend(question: str, analysis: QueryAnalysis, top_k: int) -> AskResp
         )
     diagnostics.record(articles_scanned=scanned, top_entities=[
         {'name': item.name, 'mention_count': item.mention_count,
-         'source_count': item.source_count, 'score': round(item.score, 4)} for item in items])
+         'source_count': item.source_count, 'score': round(item.score, 4),
+         'candidate_type': item.candidate_type} for item in items])
     if not items:
-        answer = INSUFFICIENT_ANSWER
+        answer = {
+            'song': '현재 수집된 기사에서는 최근 노래 순위를 충분히 집계하기 어렵습니다.',
+            'movie': '현재 수집된 기사에서는 최근 영화 순위를 충분히 집계하기 어렵습니다.',
+            'drama': '현재 수집된 기사에서는 최근 드라마 순위를 충분히 집계하기 어렵습니다.',
+        }.get(analysis.target_type, INSUFFICIENT_ANSWER)
         trace = diagnostics.snapshot()
         reason = ('no_articles' if not scanned else 'no_entity_candidates'
                   if not trace.get('raw_entities') else 'no_eligible_entities_after_fallback')
@@ -458,7 +559,7 @@ def answer_question(question: str, top_k: int) -> AskResponse:
     checked = _title_fallback(question, reviewed, results, checked, analysis)
     if not checked.citation_ids:
         suggestion_results = _search_suggestions(question, top_k, analysis)
-        return _suggestion_response(question, analysis, suggestion_results or results, started,
+        return _suggestion_response(question, analysis, suggestion_results, started,
                                     'no_supported_sentence_after_validation')
     used_results = [results[number - 1] for number in checked.citation_ids]
     answer = remap_citations(checked.answer, checked.citation_ids)

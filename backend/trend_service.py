@@ -45,7 +45,7 @@ GENERIC = {
     '경기', '전국', '전시', '축제', '센터', '협회', '기업', '시장', '정부',
 }
 ENTITY_PATTERN = re.compile(r'[가-힣A-Za-z][가-힣A-Za-z0-9&+·.-]{1,15}')
-QUOTED_PATTERN = re.compile(r'["\'“‘「『]([^"\'”’」』]{2,20})["\'”’」』]')
+QUOTED_PATTERN = re.compile(r'["\'“‘「『]([^"\'”’」』]{2,80})["\'”’」』]')
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,7 @@ class TrendItem:
     latest_at: datetime | None
     score: float
     articles: tuple[dict, ...]
+    candidate_type: str = 'entertainer'
 
 
 def period_days(time_range: str) -> int:
@@ -109,6 +110,45 @@ def extract_candidates(title: str) -> list[str]:
             seen.add(key)
             unique.append(name)
     return unique
+
+
+WORK_MARKERS = {
+    'song': ('신곡', '타이틀곡', '싱글', 'OST', '수록곡', '음원', '곡', '발매', '차트', '컴백'),
+    'movie': ('영화', '개봉', '박스오피스', '관객', '시사회', '감독', '작품', '흥행'),
+    'drama': ('드라마', '시리즈', '시즌', '방영', 'OTT', '방송', '작품'),
+}
+
+
+def _work_context(text: str, marker: str, value: str) -> bool:
+    start = max(0, text.casefold().find(value.casefold()) - 100)
+    end = min(len(text), start + len(value) + 100)
+    window = text[start:end].casefold()
+    return marker.casefold() in window
+
+
+def _extract_work_candidates(text: str, target: str) -> list[str]:
+    markers = WORK_MARKERS[target]
+    candidates = []
+    for match in QUOTED_PATTERN.finditer(text or ''):
+        value = _normalize(match.group(1))
+        context = text[max(0, match.start() - 100):min(len(text), match.end() + 100)]
+        if value.casefold() in {word.casefold() for word in GENERIC}:
+            continue
+        if any(marker.casefold() in context.casefold() for marker in markers):
+            candidates.append(value)
+    return list(dict.fromkeys(candidates))
+
+
+def extract_song_candidates(title: str, content: str = '') -> list[str]:
+    return _extract_work_candidates(f'{title}\n{content}', 'song')
+
+
+def extract_movie_candidates(title: str, content: str = '') -> list[str]:
+    return _extract_work_candidates(f'{title}\n{content}', 'movie')
+
+
+def extract_drama_candidates(title: str, content: str = '') -> list[str]:
+    return _extract_work_candidates(f'{title}\n{content}', 'drama')
 
 
 def _passage(row: dict) -> str:
@@ -206,7 +246,14 @@ def _entity_rows(rows: list[dict], category_hint: str | None) -> list[dict]:
         catalog = [item for article_mentions in mentions for item in article_mentions]
         eligible = {(name, kind) for name, kind in catalog if not desired or kind == desired}
     diagnostics.record(raw_entities=len({name for name, _ in catalog}),
-                       eligible_entities=len({name for name, _ in eligible}))
+                       eligible_entities=len({name for name, _ in eligible}),
+                       raw_candidates=[{'name': name, 'candidate_type': kind,
+                                        'context': 'person_or_group'} for name, kind in catalog],
+                       validated_candidates=[{'name': name, 'candidate_type': kind,
+                                              'context': 'person_or_group'} for name, kind in eligible])
+    diagnostics.record(extractor_used=(
+        'extract_idol_group_candidates' if category_hint in {'idol', 'group'}
+        else 'extract_person_candidates'))
     eligible_names = {ENTITY_ALIASES.get(name.casefold(), name) for name, _ in eligible}
     output = []
     for row, article_mentions in zip(rows, mentions):
@@ -216,6 +263,36 @@ def _entity_rows(rows: list[dict], category_hint: str | None) -> list[dict]:
                  for name, _ in article_mentions
                  if ENTITY_ALIASES.get(name.casefold(), name) in eligible_names}
         output.append({**row, '_trend_entities': sorted(names)})
+    return output
+
+
+def extract_person_candidates(rows: list[dict], category_hint: str | None = None) -> list[dict]:
+    return _entity_rows(rows, category_hint)
+
+
+def extract_idol_group_candidates(rows: list[dict]) -> list[dict]:
+    return _entity_rows(rows, 'idol')
+
+
+def _work_entity_rows(rows: list[dict], target_type: str) -> list[dict]:
+    extractor = {
+        'song': extract_song_candidates,
+        'movie': extract_movie_candidates,
+        'drama': extract_drama_candidates,
+    }[target_type]
+    output = []
+    raw = set()
+    for row in rows:
+        names = extractor(row.get('title') or '', row.get('content') or '')
+        raw.update(names)
+        output.append({**row, '_trend_entities': names,
+                       '_trend_candidate_types': {name: target_type for name in names}})
+    diagnostics.record(raw_entities=len(raw), eligible_entities=len(raw),
+                       extractor_used=f'extract_{target_type}_candidates',
+                       raw_candidates=[{'name': name, 'candidate_type': target_type,
+                                        'context': target_type} for name in sorted(raw)],
+                       validated_candidates=[{'name': name, 'candidate_type': target_type,
+                                              'context': target_type} for name in sorted(raw)])
     return output
 
 
@@ -245,6 +322,10 @@ def _category_allowed(row: dict, category_hint: str | None) -> bool:
 
 def aggregate_rows(rows: list[dict], now: datetime, top_k: int = config.TREND_TOP_K,
                    category_hint: str | None = None) -> list[TrendItem]:
+    target = {'idol': 'idol_or_group', 'group': 'idol_or_group', 'actor': 'actor'}.get(
+        category_hint, category_hint)
+    if target in {'song', 'movie', 'drama'} and not all('_trend_candidate_types' in row for row in rows):
+        rows = _work_entity_rows(rows, target)
     grouped = defaultdict(list)
     seen_articles = set()
     for row in rows:
@@ -256,6 +337,9 @@ def aggregate_rows(rows: list[dict], now: datetime, top_k: int = config.TREND_TO
             continue
         names = row['_trend_entities'] if '_trend_entities' in row else extract_candidates(row.get('title') or '')
         for name in names:
+            candidate_type = row.get('_trend_candidate_types', {}).get(name, target or 'entertainer')
+            if target in {'song', 'movie', 'drama', 'actor', 'idol_or_group'} and candidate_type != target:
+                continue
             grouped[name.casefold()].append((name, row))
     if not grouped:
         return []
@@ -273,12 +357,22 @@ def aggregate_rows(rows: list[dict], now: datetime, top_k: int = config.TREND_TO
                  + len(sources) / max_sources * config.TREND_SOURCE_WEIGHT
                  + recency * config.TREND_RECENCY_WEIGHT)
         representative = tuple(sorted(articles, key=lambda article: _as_utc(article.get('published_at')) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:2])
-        result.append(TrendItem(name, len(articles), len(sources), latest, score, representative))
+        candidate_type = next(
+            (article.get('_trend_candidate_types', {}).get(name, target or 'entertainer')
+             for article in articles), target or 'entertainer')
+        result.append(TrendItem(name, len(articles), len(sources), latest, score,
+                                representative, candidate_type))
     minimum = config.TREND_MIN_ARTICLE_COUNT
     eligible = [item for item in result if item.mention_count >= minimum]
     if not eligible:
         eligible = [item for item in result if item.mention_count >= 1]
     diagnostics.record(ranking_candidates=len(eligible))
+    diagnostics.record(final_candidates=[
+        {'name': item.name, 'candidate_type': item.candidate_type,
+         'context': item.candidate_type, 'mention_count': item.mention_count,
+         'source_count': item.source_count}
+        for item in sorted(eligible, key=lambda value: (-value.score, -value.mention_count))[:top_k]
+    ])
     return sorted(eligible, key=lambda item: (-item.score, -item.mention_count, -(item.latest_at.timestamp() if item.latest_at else 0)))[:top_k]
 
 
@@ -289,9 +383,22 @@ def aggregate(time_range: str, top_k: int = config.TREND_TOP_K,
     diagnostics.record(articles_scanned=len(rows), raw_entities=0, eligible_entities=0,
                        period_start=period_start(time_range, now), period_end=now,
                        article_limit=config.TREND_ARTICLE_LIMIT)
-    # Use the same batches for different population questions; extraction is
-    # cached by exact DB passages, while population filtering remains per query.
+    target = {'idol': 'idol_or_group', 'group': 'idol_or_group', 'actor': 'actor'}.get(
+        category_hint, category_hint)
+    extractor = {
+        'song': 'extract_song_candidates', 'movie': 'extract_movie_candidates',
+        'drama': 'extract_drama_candidates', 'actor': 'extract_person_candidates',
+        'idol_or_group': 'extract_idol_group_candidates',
+    }.get(target, 'extract_person_candidates')
+    diagnostics.record(target_type=target or 'celebrity_general', extractor_used=extractor)
+    # Work extractors never fall back to person extraction. Person/group
+    # extraction remains cached by exact DB passages and filtered per query.
     selected = [row for row in rows if _category_allowed(row, None) or
                 re.search(r'아이돌|걸그룹|보이그룹|배우|가수', _passage(row))]
-    grounded = _entity_rows(selected, category_hint) if selected else []
+    if target in {'song', 'movie', 'drama'}:
+        grounded = _work_entity_rows(selected, target) if selected else []
+    elif target == 'idol_or_group':
+        grounded = extract_idol_group_candidates(selected) if selected else []
+    else:
+        grounded = extract_person_candidates(selected, category_hint) if selected else []
     return aggregate_rows(grounded, now, top_k, category_hint), len(rows)
