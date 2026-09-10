@@ -16,6 +16,8 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from sources_rss import EXTRA_RSS_SOURCES
 from keyword_extractor import extract_keywords
 from sources_public_event import fetch_public_events
+from sources_tmdb import fetch_tmdb_articles
+
 
 import feedparser
 import trafilatura
@@ -154,13 +156,15 @@ def main():
         for source in RSS_SOURCES:
             source_ids[source["source_name"]] = get_or_create_source_id(conn, source["source_name"])
         source_ids["문화포털"] = get_or_create_source_id(conn, "문화포털")   # ← 이 줄 추가
+        source_ids["TMDB"] = get_or_create_source_id(conn, "TMDB")
 
         articles = fetch_articles()
         articles += fetch_public_events()
+        articles += fetch_tmdb_articles()
         for a in articles:
             if "keywords" not in a:
                 a["keywords"] = []
-        print(f"RSS+공공행사에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
+        print(f"RSS+공공행사+TMDB에서 {len(articles)}건 목록 확보 (무관 기사 필터링 후), 본문 추출 시작...")
 
         for i, article in enumerate(articles, 1):
             fetched += 1
