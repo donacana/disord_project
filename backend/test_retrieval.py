@@ -4,8 +4,10 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend import config, db, main, rag, retrieval
-from backend.query_utils import analyze_query, extract_keywords
+from backend import config, db, main, openai_client, rag, retrieval
+from backend.query_utils import (analyze_query, expand_query, extract_definition_entity,
+                                 extract_keywords, merge_llm_analysis, rule_query_analysis,
+                                 should_use_llm)
 
 NOW = datetime(2026, 9, 9, tzinfo=timezone.utc)
 
@@ -40,7 +42,7 @@ class RetrievalTests(unittest.TestCase):
         rows = [article(1, '아이브', .29), article(2, '무관 기사', .6)]
         with patch.object(db, 'fetch_all', return_value=rows) as fetch:
             result = retrieval.search([0.1], '아이브', 5, .3)
-        self.assertEqual(fetch.call_args.args[1][-1], 20)
+        self.assertEqual(fetch.call_args.args[1][-1], 40)
         self.assertEqual([r['article_id'] for r in result], [1])
         self.assertEqual(retrieval.rank_candidates(rows, '아이브', 5, .9), [])
 
@@ -80,11 +82,118 @@ class RetrievalTests(unittest.TestCase):
             self.assertEqual((hints.entities, hints.intent, hints.categories, hints.recent_days),
                              (entities, intent, categories, days))
 
+    def test_definition_activity_and_query_expansion(self):
+        definition_questions = [
+            '스트레이 키즈가 누군데',
+            '스트레이 키즈는 누구야',
+            '스트레이 키즈 어떤 그룹이야',
+            '알파드라이브원은 누구야',
+        ]
+        for question in definition_questions:
+            hints = analyze_query(question)
+            self.assertEqual(hints.intent, 'definition', question)
+            self.assertEqual(len(hints.entities), 1, question)
+            self.assertIn(hints.entities[0], question, question)
+            definition = retrieval.rank_candidates(
+                [article(1, f'{hints.entities[0]}, 새 앨범으로 컴백', .28)],
+                question, 5, now=NOW)
+            self.assertEqual([row['article_id'] for row in definition], [1], question)
+        self.assertEqual(extract_definition_entity('스트레이 키즈가 누군데'), '스트레이 키즈')
+        self.assertEqual(extract_definition_entity('알파드라이브원은 누구야'), '알파드라이브원')
+        self.assertIn('스트레이 키즈 데뷔', expand_query('스트레이 키즈는 누구야'))
+
+        row = article(1, '스트레이 키즈 새 앨범 발표', .21)
+        row['category'] = 'trend'
+        self.assertEqual(retrieval.rank_candidates([row], '스트레이 키즈는 누구야', 5, now=NOW)[0]['article_id'], 1)
+
+        activity = retrieval.rank_candidates(
+            [article(1, '장원영 광고 화보 공개', .45)],
+            '장원영 최근 활동 알려줘', 5, now=NOW)
+        self.assertEqual([row['article_id'] for row in activity], [1])
+
+        controversy = retrieval.rank_candidates(
+            [article(1, '장원영 광고 화보', .9), article(2, '장원영 법적 대응 논란', .45)],
+            '장원영 논란 있었어?', 5, now=NOW)
+        self.assertEqual(controversy[0]['article_id'], 2)
+
+    def test_structured_query_analysis_and_llm_fallback_policy(self):
+        cases = [
+            ('스트레이 키즈가 누군데', '스트레이 키즈', 'definition', 'unknown'),
+            ('스키즈 요즘 뭐함?', '스트레이 키즈', 'activity', 'recent'),
+            ('장원영 무슨 일 있었음?', '장원영', 'controversy', 'unknown'),
+            ('최근 컴백한 아이돌 그룹 알려줘', None, 'comeback', 'recent'),
+            ('요즘 누가 유명해?', None, 'trend_ranking', 'recent'),
+        ]
+        for question, entity, intent, time_range in cases:
+            analysis = rule_query_analysis(question)
+            self.assertEqual((analysis.entity, analysis.intent, analysis.time_range),
+                             (entity, intent, time_range), question)
+        self.assertTrue(should_use_llm(rule_query_analysis('스키즈 요즘 뭐함?')))
+        self.assertFalse(should_use_llm(rule_query_analysis('장원영 최근 활동 알려줘')))
+        rule = rule_query_analysis('장원영 최근 활동 알려줘')
+        invalid = merge_llm_analysis(rule, {'intent': 'made_up_intent'})
+        self.assertEqual(invalid.intent, 'general')
+
+    def test_llm_query_analysis_json_and_failure(self):
+        response = type('Response', (), {'choices': [type('Choice', (), {
+            'message': type('Message', (), {'content': '{"original_question":"스키즈 요즘 뭐함?","entity":"스트레이 키즈","intent":"activity","time_range":"recent","keywords":["앨범"],"search_queries":["스트레이 키즈 최근 활동","스트레이 키즈 앨범"],"normalized_question":"스트레이 키즈 최근 활동","confidence":0.92}'})()
+        })()]})()
+        client = type('Client', (), {'chat': type('Chat', (), {
+            'completions': type('Completions', (), {'create': lambda self, **kwargs: response})()
+        })()})()
+        with patch.object(openai_client, '_client', return_value=client):
+            payload = openai_client.analyze_question('스키즈 요즘 뭐함?')
+        self.assertEqual(payload['entity'], '스트레이 키즈')
+        self.assertEqual(payload['intent'], 'activity')
+        with patch.object(openai_client, '_client', side_effect=openai_client.OpenAIServiceError('timeout')):
+            with self.assertRaises(openai_client.OpenAIServiceError):
+                openai_client.analyze_question('스키즈 요즘 뭐함?')
+
+    def test_query_understanding_is_rule_first_and_failure_safe(self):
+        with patch.object(openai_client, 'analyze_question', return_value={
+            'original_question': '장원영 최근 활동 알려줘',
+            'entity': '장원영', 'intent': 'activity', 'time_range': 'recent',
+            'keywords': ['활동'], 'search_queries': ['장원영 최근 활동'],
+            'normalized_question': '장원영 최근 활동', 'confidence': 0.9,
+        }) as analyze:
+            result, used = rag._query_analysis('장원영 최근 활동 알려줘')
+        analyze.assert_called_once()
+        self.assertTrue(used)
+        self.assertEqual((result.entity, result.intent), ('장원영', 'activity'))
+
+        with patch.object(openai_client, 'analyze_question', return_value={
+            'entity': '스트레이 키즈', 'intent': 'activity', 'time_range': 'recent',
+            'keywords': ['컴백', '앨범'], 'normalized_question': '스트레이 키즈 최근 활동',
+            'confidence': 0.92,
+        }) as analyze:
+            result, used = rag._query_analysis('스키즈 요즘 뭐함?')
+        analyze.assert_called_once()
+        self.assertTrue(used)
+        self.assertEqual((result.entity, result.intent, result.time_range),
+                         ('스트레이 키즈', 'activity', 'recent'))
+
+        with patch.object(openai_client, 'analyze_question',
+                          side_effect=openai_client.OpenAIServiceError('timeout')):
+            result, used = rag._query_analysis('스키즈 요즘 뭐함?')
+        self.assertFalse(used)
+        self.assertEqual((result.entity, result.intent), ('스트레이 키즈', 'activity'))
+
+    def test_low_confidence_uses_rule_fallback(self):
+        with patch.object(openai_client, 'analyze_question', return_value={
+            'original_question': '장원영 최근 활동 알려줘',
+            'entity': '장원영', 'intent': 'activity', 'time_range': 'recent',
+            'keywords': [], 'search_queries': ['장원영'],
+            'normalized_question': '장원영', 'confidence': 0.2,
+        }):
+            result, used = rag._query_analysis('장원영 최근 활동 알려줘')
+        self.assertFalse(used)
+        self.assertEqual((result.entity, result.intent), ('장원영', 'activity'))
+
     def test_activity_vs_controversy(self):
         rows = [article(1, '테스트가수 고소 사건 법원 판결', .8, '공연 이력'),
                 article(2, '테스트가수 앨범 발매 공연', .5)]
         activity = retrieval.rank_candidates(rows, '테스트가수 최근 활동 알려줘', 5, now=NOW)
-        self.assertEqual([r['article_id'] for r in activity], [2])
+        self.assertEqual([r['article_id'] for r in activity], [2, 1])
         controversy = retrieval.rank_candidates(rows, '테스트가수 논란 있었어?', 5, now=NOW)
         self.assertEqual(controversy[0]['article_id'], 1)
 
@@ -114,7 +223,7 @@ class RetrievalTests(unittest.TestCase):
                 article(3, '영화 개봉주 무대인사', .45)]
         rows[2]['category'] = 'webtoon'
         ranked = retrieval.rank_candidates(rows, '최근 영화 개봉작 알려줘', 5, now=NOW)
-        self.assertEqual([r['article_id'] for r in ranked], [3])
+        self.assertEqual([r['article_id'] for r in ranked], [1, 3, 2])
 
     def test_source_diversity_and_shortage(self):
         rows = [article(i, f'문화 소식 {i}', .7 - i * .005) for i in range(1, 7)]
@@ -166,6 +275,13 @@ class RetrievalTests(unittest.TestCase):
         rescued = retrieval.rank_candidates([article(1, '테스트가수', .29)], '테스트가수', 5, .3, NOW)
         self.assertEqual(len(rescued), 1)
         self.assertEqual(retrieval.rank_candidates([article(1, '테스트가수', .29)], '테스트가수', 5, .5, NOW), [])
+        weak_title = retrieval.rank_candidates(
+            [article(1, '테스트가수 새 앨범 발표', .16)], '테스트가수 최근 활동', 5, .3, NOW)
+        self.assertEqual([row['article_id'] for row in weak_title], [1])
+        weak_body = retrieval.rank_candidates(
+            [article(1, '새 앨범 발표', .16, content='테스트가수의 새 앨범 활동')],
+            '테스트가수 최근 활동', 5, .3, NOW)
+        self.assertEqual([row['article_id'] for row in weak_body], [1])
         weights = [config.VECTOR_WEIGHT, config.KEYWORD_WEIGHT, config.TITLE_WEIGHT, config.RECENCY_WEIGHT,
                    config.ENTITY_WEIGHT, config.INTENT_WEIGHT, config.CATEGORY_WEIGHT]
         self.assertAlmostEqual(sum(weights), 1.0)

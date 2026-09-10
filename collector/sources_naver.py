@@ -153,6 +153,28 @@ NAVER_SEARCH_QUERIES = [
     {"query": "키링 유행", "category": "trend"},
     {"query": "캐릭터 팝업", "category": "trend"},
     {"query": "굿즈 팝업", "category": "trend"},
+    
+    {"query": "강훈", "category": "celeb"},
+    {"query": "김혜준", "category": "celeb"},
+    {"query": "서인영", "category": "celeb"},
+    {"query": "조권", "category": "celeb"},
+    {"query": "이민호", "category": "celeb"},
+    {"query": "소연", "category": "celeb"},
+    {"query": "한은서", "category": "celeb"},
+    {"query": "효연", "category": "celeb"},
+    {"query": "박해일", "category": "celeb"},
+    {"query": "안정환", "category": "celeb"},
+    {"query": "설경구", "category": "celeb"},
+    {"query": "이혁재", "category": "celeb"},
+    {"query": "미연", "category": "celeb"},
+    {"query": "유해진", "category": "celeb"},
+    {"query": "백선호", "category": "celeb"},
+    {"query": "전현무", "category": "celeb"},
+    {"query": "이정", "category": "celeb"},
+    {"query": "류준열", "category": "celeb"},
+    {"query": "임영웅", "category": "celeb"},
+    {"query": "아이유", "category": "celeb"},
+    {"query": "최민식", "category": "celeb"},    
 ]
 
 

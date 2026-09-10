@@ -49,6 +49,17 @@ class ValidatorTests(unittest.TestCase):
             self.assertEqual(result.answer, SUPPORTED, sentence)
             self.assertEqual(result.removed_sentences, (sentence,))
 
+    def test_grounded_paraphrase_keeps_supported_sentence(self):
+        result = validate_answer('테스트그룹은 게임 협업을 진행했습니다.[1]', [EVIDENCE])
+        self.assertEqual(result.citation_ids, (1,))
+        unsupported = validate_answer('테스트그룹은 큰 인기를 끌고 있습니다.[1]', [EVIDENCE])
+        self.assertEqual(unsupported.answer, INSUFFICIENT_ANSWER)
+        definition = validate_answer(
+            '스트레이 키즈는 그룹이며 최근 새 앨범을 발매했습니다.[1]',
+            ['그룹 스트레이 키즈가 새 앨범을 발매했습니다.'],
+        )
+        self.assertEqual(definition.citation_ids, (1,))
+
     def test_numeric_boundaries_and_units(self):
         evidence = '테스트그룹 2026년 11월 공연. 관객 12명. 가격 1.5만원.'
         for claim in ['테스트그룹 2026년 1월 공연.[1]', '관객 2명.[1]', '가격 1.6만원.[1]']:
@@ -89,8 +100,9 @@ class ValidatorTests(unittest.TestCase):
 
     def test_contradictory_global_conclusion(self):
         result = validate_answer(SUPPORTED + '\n현재 수집된 자료에서 확인하기 어렵습니다.', [EVIDENCE])
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.citation_ids, ())
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(result.citation_ids, (1,))
+        self.assertEqual(result.removed_sentences, ('현재 수집된 자료에서 확인하기 어렵습니다.',))
         self.assertEqual(validate_answer('', [EVIDENCE]).answer, INSUFFICIENT_ANSWER)
 
     def test_only_visible_context_can_support_claims(self):
@@ -136,9 +148,9 @@ class PipelineTests(unittest.TestCase):
                 patch.object(rag, 'verify_answer', return_value='테스트그룹 2026년 데뷔.[1]'), \
                 patch.object(db, 'execute') as log:
             result = rag.answer_question('테스트그룹 활동', 5)
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.sources, [])
-        self.assertFalse(log.call_args.args[1][4])
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(len(result.sources), 1)
+        self.assertTrue(log.call_args.args[1][4])
 
     def test_verifier_failure_and_missing_results_fail_closed(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
@@ -146,8 +158,8 @@ class PipelineTests(unittest.TestCase):
                 patch.object(rag, 'verify_answer', side_effect=openai_client.OpenAIServiceError('failed')) as verify, \
                 patch.object(db, 'execute'):
             result = rag.answer_question('테스트그룹 활동', 5)
-        self.assertEqual(result.answer, INSUFFICIENT_ANSWER)
-        self.assertEqual(result.sources, [])
+        self.assertEqual(result.answer, SUPPORTED)
+        self.assertEqual(len(result.sources), 1)
         verify.assert_called_once()
         with patch.object(rag, '_search', return_value=[]), \
                 patch.object(rag, 'generate_answer') as generate, \
@@ -179,6 +191,34 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(client.chat.completions.create.call_count, 2)
         self.assertEqual([call.kwargs['model'] for call in client.chat.completions.create.call_args_list],
                          ['configured-model', 'configured-model'])
+
+    def test_answer_prompts_allow_grounded_detail(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=SUPPORTED))])
+        with patch.object(openai_client, '_client', return_value=client):
+            openai_client.generate_answer('테스트그룹 최근 활동', EVIDENCE)
+            openai_client.verify_answer('테스트그룹 최근 활동', EVIDENCE, SUPPORTED)
+        generation_prompt = client.chat.completions.create.call_args_list[0].kwargs['messages'][0]['content']
+        verification_prompt = client.chat.completions.create.call_args_list[1].kwargs['messages'][0]['content']
+        self.assertIn('최대 6개의 짧은 문장', generation_prompt)
+        self.assertIn('기사 제목을 그대로 반복하지 말고', generation_prompt)
+        self.assertIn('최대 6개까지 유지하라', verification_prompt)
+
+    def test_multiple_grounded_sentences_survive(self):
+        evidence = [
+            '테스트그룹은 새 앨범을 발매했습니다. 테스트그룹은 공연을 진행했습니다.',
+            '테스트그룹은 방송에 출연했습니다.',
+        ]
+        answer = ('테스트그룹은 새 앨범을 발매했습니다.[1]\n'
+                  '테스트그룹은 공연을 진행했습니다.[1]\n'
+                  '테스트그룹은 방송에 출연했습니다.[2]')
+        result = validate_answer(answer, evidence)
+        self.assertEqual(result.citation_ids, (1, 2))
+        self.assertEqual(len(result.answer.splitlines()), 3)
+        unsupported = validate_answer(answer + '\n테스트그룹은 세계 최고입니다.[1]', evidence)
+        self.assertEqual(len(unsupported.answer.splitlines()), 3)
+        self.assertTrue(unsupported.removed_sentences)
 
     def test_generation_failure_keeps_503_contract(self):
         with patch.object(rag, '_search', return_value=[article(1)]), \
